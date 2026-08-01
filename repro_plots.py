@@ -37,8 +37,8 @@ ARMS = {
         ("GP + Random", "#be185d"),
 }
 LEVGP = "xac.acquisition_functions.LeverageGPSampler"
-GAME_ORDER = ["dvbsgb_10", "dvbsrf_10", "dvchgb_10",
-              "vit_9", "resnet_14", "vit_16"]
+GAME_ORDER = ["vit_9", "dvbsgb_10", "dvbsrf_10", "dvchgb_10",
+              "resnet_14", "vit_16"]  # rows in increasing p
 GAME_TITLES = {"dvbsrf_10": "DV; RF; Bike Sharing (p=10)",
                "dvbsgb_10": "DV; GB; Bike Sharing (p=10)",
                "dvchgb_10": "DV; GB; Cal. Housing (p=10)",
