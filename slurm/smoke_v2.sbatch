@@ -13,7 +13,7 @@
 #SBATCH --mem=64gb
 #SBATCH --time=00:59:00
 #SBATCH --job-name=shapleig-smoke-v2
-#SBATCH --output=/hopper/groups/witterlab/rwitter/scratch/shapleig-order/smoke_v2_%j.out
+#SBATCH --output=/hopper/groups/witterlab/rwitter/scratch/shapleig-order/run_logs/smoke_v2_%j.out
 
 source ~/.bashrc
 cd /hopper/groups/witterlab/rwitter/scratch/shapleig-order/shapleig-repo

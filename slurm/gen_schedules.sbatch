@@ -10,7 +10,7 @@
 #SBATCH --mem=48gb
 #SBATCH --time=06:00:00
 #SBATCH --job-name=shapleig-gen-schedules
-#SBATCH --output=/hopper/groups/witterlab/rwitter/scratch/shapleig-order/gen_schedules_%j.out
+#SBATCH --output=/hopper/groups/witterlab/rwitter/scratch/shapleig-order/run_logs/gen_schedules_%j.out
 
 source ~/.bashrc
 PY=/hopper/groups/witterlab/rwitter/scratch/shapleig-order/.venv-repro/bin/python

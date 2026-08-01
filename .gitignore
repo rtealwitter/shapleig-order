@@ -3,6 +3,7 @@
 __pycache__/
 *.pyc
 *.out
+run_logs/
 shapleig-repo/.git-upstream/
 shapleig-repo/multirun/
 shapleig-repo/outputs/

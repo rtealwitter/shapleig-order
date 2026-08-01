@@ -64,7 +64,7 @@ def main():
         fig.suptitle(f"{name}  (d = {d}, 8 seeds, median with 20–80% band)",
                      fontsize=11)
         for ext in ("png", "svg"):
-            fig.savefig(os.path.join(HERE, f"bench_{name}.{ext}"), dpi=180)
+            fig.savefig(os.path.join(HERE, "figures", "bench", f"bench_{name}.{ext}"), dpi=180)
         plt.close(fig)
         print(f"plotted {name}")
 

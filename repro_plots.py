@@ -19,6 +19,7 @@ import matplotlib.pyplot as plt
 import yaml
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+FIGDIR = os.path.join(HERE, "figures")
 
 ARMS = {
     "xac.acquisition_functions.EIGFunctionProperty":
@@ -166,8 +167,9 @@ def main(roots):
         axS.set_ylim(-0.3, p / 2 + 0.3)
         axS.grid(True)
         fig.suptitle(GAME_TITLES.get(game, game), fontsize=11)
+        os.makedirs(FIGDIR, exist_ok=True)
         for ext in ("png", "svg"):
-            fig.savefig(os.path.join(HERE, f"hybrid_{game}.{ext}"), dpi=180)
+            fig.savefig(os.path.join(FIGDIR, f"{game}.{ext}"), dpi=180)
         plt.close(fig)
         print(f"plotted {game}")
 

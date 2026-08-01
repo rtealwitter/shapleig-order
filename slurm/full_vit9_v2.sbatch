@@ -14,7 +14,7 @@
 #SBATCH --mem=120gb
 #SBATCH --time=06:00:00
 #SBATCH --job-name=shapleig-full-vit9-v2
-#SBATCH --output=/hopper/groups/witterlab/rwitter/scratch/shapleig-order/full_vit9_v2_%j.out
+#SBATCH --output=/hopper/groups/witterlab/rwitter/scratch/shapleig-order/run_logs/full_vit9_v2_%j.out
 
 source ~/.bashrc
 cd /hopper/groups/witterlab/rwitter/scratch/shapleig-order/shapleig-repo

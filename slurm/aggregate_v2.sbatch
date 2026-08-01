@@ -10,7 +10,7 @@
 #SBATCH --mem=32gb
 #SBATCH --time=01:00:00
 #SBATCH --job-name=shapleig-aggregate-v2
-#SBATCH --output=/hopper/groups/witterlab/rwitter/scratch/shapleig-order/agg_v2_%j.out
+#SBATCH --output=/hopper/groups/witterlab/rwitter/scratch/shapleig-order/run_logs/agg_v2_%j.out
 
 source ~/.bashrc
 D=/hopper/groups/witterlab/rwitter/scratch/shapleig-order

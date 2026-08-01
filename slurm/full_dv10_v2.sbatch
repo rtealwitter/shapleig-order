@@ -14,7 +14,7 @@
 #SBATCH --mem=200gb
 #SBATCH --time=12:00:00
 #SBATCH --job-name=shapleig-full-dv10-v2
-#SBATCH --output=/hopper/groups/witterlab/rwitter/scratch/shapleig-order/full_dv10_v2_%j.out
+#SBATCH --output=/hopper/groups/witterlab/rwitter/scratch/shapleig-order/run_logs/full_dv10_v2_%j.out
 
 source ~/.bashrc
 cd /hopper/groups/witterlab/rwitter/scratch/shapleig-order/shapleig-repo
