@@ -1,0 +1,9 @@
+.venv/
+.venv-repro/
+__pycache__/
+*.pyc
+*.out
+shapleig-repo/.git-upstream/
+shapleig-repo/multirun/
+shapleig-repo/outputs/
+sweep_roots_v2.txt

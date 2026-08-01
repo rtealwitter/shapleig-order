@@ -1,0 +1,1195 @@
+diff --git a/src/xac/acquisition_functions/__init__.py b/src/xac/acquisition_functions/__init__.py
+index 8e77cf8..3f4d46f 100644
+--- a/src/xac/acquisition_functions/__init__.py
++++ b/src/xac/acquisition_functions/__init__.py
+@@ -1,6 +1,6 @@
+ from .acquisition_functions import (EPIG, BaseAcquisitionFunction,
+                                     EIGExecutionPath, EIGFunctionProperty,
+-                                    Random, SHAPKernelSampler, SHAPIQAcquisitionFunction, KernelSHAPSampler, SVARMSampler, PermutationSampler, RegressionMSRSampler, LeverageSHAPSampler, LeverageGPSampler) #SHAPIQSampler
++                                    HybridPairedEIG, PairedExtremes, Random, SHAPKernelSampler, SHAPIQAcquisitionFunction, KernelSHAPSampler, SVARMSampler, PermutationSampler, RegressionMSRSampler, LeverageSHAPSampler, LeverageGPSampler) #SHAPIQSampler
+ 
+ __all__ = [
+     "BaseAcquisitionFunction",
+@@ -9,6 +9,8 @@ __all__ = [
+     "EPIG",
+     "SHAPKernelSampler",
+     "Random",
++    "PairedExtremes",
++    "HybridPairedEIG",
+     "SHAPIQAcquisitionFunction",
+     "KernelSHAPSampler",
+     "SVARMSampler",
+diff --git a/src/xac/acquisition_functions/acquisition_functions.py b/src/xac/acquisition_functions/acquisition_functions.py
+index d97fba4..1513c3e 100644
+--- a/src/xac/acquisition_functions/acquisition_functions.py
++++ b/src/xac/acquisition_functions/acquisition_functions.py
+@@ -668,3 +668,145 @@ class SHAPKernelSampler(BaseAcquisitionFunction):
+     @property
+     def plot_name(self) -> str:
+         return "SHAP-Kernel-Sampler"
++
++
++def _binary_masks(X: torch.Tensor, surrogate: GPSurrogate) -> list[int]:
++    """Bit masks of the coalitions in X (continuous encoding)."""
++    X_binary = surrogate._model.input_transform(X)
++    bits = (X_binary > 0.5).to(torch.int64)
++    weights = 2 ** torch.arange(bits.shape[1], dtype=torch.int64)
++    return [int(m) for m in (bits * weights).sum(dim=1).tolist()]
++
++
++def _load_schedule(path_template: str, p: int) -> list[int]:
++    import numpy as _np
++
++    return [int(s) for s in _np.load(path_template.format(p=p))]
++
++
++@dataclass(frozen=True)
++class PairedExtremes(BaseAcquisitionFunction):
++    """Fixed-kernel greedy schedule: complement-paired extremes, then balanced
++    middles. The schedule is value-independent (posterior covariance depends
++    only on which coalitions were evaluated), precomputed offline with a
++    symmetric Hamming kernel, and simply replayed here. Selection never needs
++    a GP fit; the surrogate is used only for the binary input transform.
++
++    Replay keeps a pointer into the schedule: entries already evaluated
++    (initial design or earlier picks) are skipped, and entries that are not
++    in the candidate set for another reason (Subset acquisition optimization
++    offers only a sampled subset of coalitions) are replaced by a candidate
++    of the scheduled size, so the schedule's size profile — and with it the
++    extremes-then-balanced-middles structure — is preserved."""
++
++    schedule_path: str = "data/paired_schedule_p{p}.npy"
++
++    def __call__(
++        self,
++        X: torch.Tensor,
++        candidate_idx_Z: torch.Tensor,
++        surrogate: GPSurrogate,
++        application: BaseApplication,
++        iteration_idx: int,
++        scalable_mode: bool = False,
++        is_no_refit_step: bool = False,
++        new_train_x: torch.Tensor | None = None,
++        prev_max_index: int | None = None,
++    ) -> torch.Tensor:
++        p = X.shape[1]
++        if not hasattr(self, "_schedule"):
++            object.__setattr__(
++                self, "_schedule", _load_schedule(self.schedule_path, p)
++            )
++
++        cand_masks = _binary_masks(X, surrogate)
++        mask_to_idx = {m: i for i, m in enumerate(cand_masks)}
++        train_bits = (surrogate._model.train_inputs[0] > 0.5).to(torch.int64)
++        weights = 2 ** torch.arange(train_bits.shape[1], dtype=torch.int64)
++        evaluated = {int(m) for m in (train_bits * weights).sum(dim=1).tolist()}
++
++        utils = torch.zeros(X.shape[0], dtype=X.dtype)
++        pos = getattr(self, "_sched_pos", 0)
++        pick = None
++        while pos < len(self._schedule):
++            s = self._schedule[pos]
++            if s in mask_to_idx:
++                pick = mask_to_idx[s]
++                pos += 1
++                break
++            if s in evaluated:
++                pos += 1  # covered by the initial design or an earlier pick
++                continue
++            # Unevaluated but not offered (Subset optimizer): take a candidate
++            # of the scheduled size instead, nearest size if none exists.
++            size = bin(s).count("1")
++            cand_sizes = [bin(m).count("1") for m in cand_masks]
++            pick = min(range(len(cand_sizes)),
++                       key=lambda i: abs(cand_sizes[i] - size))
++            pos += 1
++            break
++        object.__setattr__(self, "_sched_pos", pos)
++        utils[pick if pick is not None else 0] = 1.0
++        return utils
++
++    @property
++    def plot_name(self) -> str:
++        return "Paired Extremes (fixed)"
++
++
++@dataclass(frozen=True)
++class HybridPairedEIG(EIGFunctionProperty):
++    """Hybrid of the fixed paired-extremes schedule and EIG selection.
++
++    While extreme coalitions (sizes 0, 1, p-1, p, in complement pairs) remain
++    unevaluated, select them in the fixed order — their information dominates
++    under any lengthscales, so neither a GP fit nor an EIG computation is
++    needed to justify them, and the parent computation is skipped entirely.
++    Once the extremes are exhausted, fall back to the parent EIG argmax; the
++    experiment runner refits the hyperparameters on a geometric schedule
++    anchored at that handover iteration (the "adaptivity rounds") and the
++    parent EIG updates incrementally between refits.
++    """
++
++    schedule_path: str = "data/paired_schedule_p{p}.npy"
++
++    def _extreme_masks(self, p: int) -> list[int]:
++        if not hasattr(self, "_extremes"):
++            sched = _load_schedule(self.schedule_path, p)
++            extremes = [s for s in sched
++                        if bin(s).count("1") in (0, 1, p - 1, p)]
++            object.__setattr__(self, "_extremes", extremes)
++        return self._extremes
++
++    def extremes_left(self, X: torch.Tensor, surrogate: GPSurrogate) -> bool:
++        """True while an unevaluated extreme coalition remains on offer."""
++        masks = set(_binary_masks(X, surrogate))
++        return any(s in masks for s in self._extreme_masks(X.shape[1]))
++
++    def __call__(
++        self,
++        X: torch.Tensor,
++        candidate_idx_Z: torch.Tensor,
++        surrogate: GPSurrogate,
++        application: BaseApplication,
++        iteration_idx: int,
++        scalable_mode: bool = False,
++        is_no_refit_step: bool = False,
++        new_train_x: torch.Tensor | None = None,
++        prev_max_index: int | None = None,
++    ) -> torch.Tensor:
++        mask_to_idx = {m: i for i, m in enumerate(_binary_masks(X, surrogate))}
++        for s in self._extreme_masks(X.shape[1]):
++            if s in mask_to_idx:
++                utils = torch.zeros(X.shape[0], dtype=X.dtype)
++                utils[mask_to_idx[s]] = 1.0
++                return utils
++
++        return super().__call__(
++            X, candidate_idx_Z, surrogate, application, iteration_idx,
++            scalable_mode, is_no_refit_step, new_train_x, prev_max_index,
++        )
++
++    @property
++    def plot_name(self) -> str:
++        return "Hybrid paired+EIG"
+diff --git a/src/xac/applications/applications.py b/src/xac/applications/applications.py
+index 3af1537..b8b4fbf 100644
+--- a/src/xac/applications/applications.py
++++ b/src/xac/applications/applications.py
+@@ -1209,6 +1209,15 @@ class ShapleyApplication(BaseApplication):
+ 
+         train_coals_bool = siq_approximator._sampler.coalitions_matrix
+ 
++        # Record the design of the current (last-called) budget so the
++        # selection-history analysis can read it; the final call leaves the
++        # full-budget design in place.
++        object.__setattr__(
++            self,
++            "archive_binary",
++            torch.tensor(np.array(train_coals_bool), dtype=torch.float64),
++        )
++
+         if self.scalable_mode:
+             train_coals_binary = torch.tensor(train_coals_bool, dtype=torch.int64)
+             train_X = temp_gp._model.input_transform.untransform(train_coals_binary)
+diff --git a/src/xac/experimental_designs/experiment_runner.py b/src/xac/experimental_designs/experiment_runner.py
+index 8b354bc..ab09efb 100644
+--- a/src/xac/experimental_designs/experiment_runner.py
++++ b/src/xac/experimental_designs/experiment_runner.py
+@@ -11,8 +11,10 @@ import gpytorch
+ from gpytorch.distributions import MultivariateNormal
+ import torch
+ 
+-from xac.acquisition_functions import (KernelSHAPSampler, LeverageGPSampler,
+-                                       SHAPIQAcquisitionFunction, SVARMSampler)
++from xac.acquisition_functions import (HybridPairedEIG, KernelSHAPSampler,
++                                       LeverageGPSampler, PairedExtremes,
++                                       Random, SHAPIQAcquisitionFunction,
++                                       SVARMSampler)
+ from xac.acquisition_optimizers import (BaseAcquisitionOptimizer, Exhaustive,
+                                         Subset)
+ from xac.applications import BaseApplication, ShapleyApplication
+@@ -32,6 +34,45 @@ def _get_peak_rss_mb() -> float:
+     return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
+ 
+ 
++# Application attributes written as caches by the EIG acquisition path and its
++# incremental (no-refit) updates. A readout on an evaluation-only surrogate
++# must not disturb them, so they are snapshotted and restored around it.
++_EIG_CACHE_ATTRS = (
++    "A_KZW",
++    "AKA",
++    "AEA_unscaled",
++    "A_KZX",
++    "prev_X",
++    "prev_X_binary",
++    "_aka_cache_key_value",
++    "_aka_cache_matrix",
++)
++
++
++def _readout_property_posterior(application, surrogate):
++    """Property posterior from an evaluation-only surrogate.
++
++    The surrogate is fit only to read out the estimate for the metrics trace;
++    its kernel differs from the frozen method surrogate, so every cached
++    quantity the incremental EIG path relies on is protected here.
++    """
++    saved = {
++        a: getattr(application, a)
++        for a in _EIG_CACHE_ATTRS
++        if hasattr(application, a)
++    }
++    try:
++        return application.property_posterior(
++            surrogate, noisy_variant=False, recycle=False
++        )
++    finally:
++        for a in _EIG_CACHE_ATTRS:
++            if a in saved:
++                object.__setattr__(application, a, saved[a])
++            elif hasattr(application, a):
++                object.__delattr__(application, a)
++
++
+ # ---------------------------------------------------------------------
+ # Experiment runner
+ # ---------------------------------------------------------------------
+@@ -141,7 +182,9 @@ def run_experiment(
+     hp_fit_durations = []
+     prop_post_durations = []
+     acq_fun_durations = []
++    eval_fit_durations = []
+     peak_rss_mb = []
++    hybrid_handover = None  # iteration at which the hybrid switches to EIG
+ 
+     #Rebuttal extras
+     test_predictions = []
+@@ -179,6 +222,12 @@ def run_experiment(
+                 else:
+                     is_no_refit_step = (iteration_idx % 32 != 0)
+ 
++            elif surrogate_cfg.fit_config.refit_schedule == "geometric":
++                # Refit at iterations 0, 1, 2, 4, 8, ... — O(log m) fits,
++                # dense early (when fits are cheap and matter most for the
++                # estimate), sparse late.
++                is_no_refit_step = (iteration_idx & (iteration_idx - 1)) != 0
++
+             else:
+                 raise ValueError(f"Unknown refit schedule.")
+             
+@@ -190,8 +239,6 @@ def run_experiment(
+ 
+         # print(iteration_idx)
+         # print(is_no_refit_step)
+-        if not is_no_refit_step:
+-            log.info(f"""Iteration {str(iteration_idx)}""")
+ 
+         if not isinstance(acquisition_fn, SHAPIQAcquisitionFunction):
+             if iteration_idx == 0:
+@@ -212,7 +259,33 @@ def run_experiment(
+                     ), "Error in cont to binary mapping."
+                     # print("hi")
+ 
+-            else:
++            # -----------------------------------------------------------------
++            # Arm-specific refit policy: the method only fits when the fit is
++            # needed for *selection*. Fixed-schedule arms (paired extremes,
++            # random) never are — their only fit is the final readout. The
++            # hybrid selects extremes without fitting, then refits on a
++            # geometric schedule anchored at the handover to EIG selection.
++            # EIG-family arms follow the configured schedule (default: every
++            # iteration). Estimates for the metrics trace are produced by
++            # separate evaluation-only fits that are not method compute.
++            if isinstance(acquisition_fn, (Random, PairedExtremes)):
++                is_no_refit_step = True
++            elif isinstance(acquisition_fn, HybridPairedEIG):
++                if hybrid_handover is None and acquisition_fn.extremes_left(
++                    candidate_set, gp
++                ):
++                    is_no_refit_step = True
++                else:
++                    if hybrid_handover is None:
++                        hybrid_handover = iteration_idx
++                    k = iteration_idx - hybrid_handover
++                    # Refit at 0, 1, 2, 4, 8, ... iterations past handover.
++                    is_no_refit_step = (k & (k - 1)) != 0
++
++            if not is_no_refit_step:
++                log.info(f"""Iteration {str(iteration_idx)}""")
++
++            if iteration_idx > 0:
+                 # if (
+                 #     hasattr(gp.config.fit_config, "warmstart")
+                 #     and gp.config.fit_config.warmstart
+@@ -327,8 +400,8 @@ def run_experiment(
+                 iteration_idx,
+                 meta_cfg.scalability_mode,
+                 is_no_refit_step,
+-                new_x if is_no_refit_step else None, #Pass selected candidate from previous iteration if HPs are not refitted
+-                best_idx if is_no_refit_step else None,
++                new_x if (is_no_refit_step and iteration_idx > 0) else None, #Pass selected candidate from previous iteration if HPs are not refitted
++                best_idx if (is_no_refit_step and iteration_idx > 0) else None,
+             )  # (M,)
+ 
+             # gp._model.covar_module(candidate_set[0:1], candidate_set[1:2]).to_dense()
+@@ -341,12 +414,40 @@ def run_experiment(
+                 peak_rss_mb.append(_get_peak_rss_mb())
+ 
+             # -----------------------------------------------------------------
+-            # compute property posterior
+-            if meta_cfg.time_ops:
+-                start_prop_post = time.perf_counter()
++            # compute property posterior (the readout for the metrics trace)
++            #
++            # When the method fit this iteration, the estimate is read from
++            # the method surrogate as before. When it did not (fixed-schedule
++            # arms; hybrid between adaptivity rounds), the trace still reports
++            # what a user stopping at this budget would obtain — fit the GP
++            # once and read the posterior — so a separate evaluation-only GP
++            # is fit here. Its cost is recorded in eval_fit_durations, NOT in
++            # the method's fit time.
++            if is_no_refit_step and not meta_cfg.skip_fitting:
++                if meta_cfg.time_ops:
++                    start_eval_fit = time.perf_counter()
++
++                readout_gp = PartialGPSurrogate(archive_X, archive_Y)
++                readout_gp.fit()
++
++                if meta_cfg.time_ops:
++                    eval_fit_durations.append(
++                        time.perf_counter() - start_eval_fit
++                    )
++
++                if meta_cfg.time_ops:
++                    start_prop_post = time.perf_counter()
++
++                prop_post = _readout_property_posterior(application, readout_gp)
++
++            else:
++                readout_gp = gp
++                if meta_cfg.time_ops:
++                    eval_fit_durations.append(0.0)
++                    start_prop_post = time.perf_counter()
+ 
+-            prop_post = application.property_posterior(gp, noisy_variant=False)
+-            #Caution: Prop post timing not accurate, as some components are recycled and HP fitting is not included
++                prop_post = application.property_posterior(gp, noisy_variant=False)
++                #Caution: Prop post timing not accurate, as some components are recycled and HP fitting is not included
+ 
+             if meta_cfg.time_ops:
+                 end_prop_post = time.perf_counter()
+@@ -357,12 +458,12 @@ def run_experiment(
+ 
+             prop_posts_noisy.append(
+                 prop_post
+-            )  
++            )
+ 
+             #Rebuttal extras: Track test predictions and labels for each iteration
+             test_labels.append(blackbox_fn.evaluate(candidate_set)[0])
+             #train_labels.append(blackbox_fn.evaluate(archive_X)[0])
+-            temp_preds_= gp.forward(candidate_set)
++            temp_preds_= readout_gp.forward(candidate_set)
+ 
+             test_predictions.append(
+                 (temp_preds_.mean.squeeze(),
+@@ -431,6 +532,13 @@ def run_experiment(
+ 
+             if isinstance(acquisition_fn, LeverageGPSampler):
+                 # Hybrid case (Fit GP surrogate on samples from LeverageSHAP)
++                # Each entry of acq_fun_durations is the FULL cost of the
++                # estimate at this budget (sampling + GP fit + posterior
++                # read); the method restarts from scratch every budget, so
++                # these durations are per-budget totals, not increments.
++                if meta_cfg.time_ops:
++                    start_acq_func = time.perf_counter()
++
+                 sv_approximations.append(
+                     application.get_levgp_siq_value(
+                         application.init_design_size + iteration_idx,
+@@ -441,6 +549,10 @@ def run_experiment(
+                     )
+                 )
+ 
++                if meta_cfg.time_ops:
++                    end_acq_func = time.perf_counter()
++                    acq_fun_durations.append(end_acq_func - start_acq_func)
++
+             else:
+ 
+                 if meta_cfg.time_ops:
+@@ -465,32 +577,27 @@ def run_experiment(
+             application.termination_criterion(prop_post) and not meta_cfg.debug_mode
+         ):
+             # Case: Procedure has not been terminated due to criterion, but as all iterations have been reached.
+-            # Compute prop post once again for newly added data.
+-            # gp = PartialGPSurrogate(archive_X, archive_Y)
+-
+-            if (
+-                hasattr(gp.config.fit_config, "warmstart")
+-                and gp.config.fit_config.warmstart
+-            ) or (is_no_refit_step):
+-                # Warmstart: Update data in existing model (leads to warmstart of hyperparameters)
+-                gp.update_data(archive_X, archive_Y)
++            # Final readout: one fresh fit on the completed archive. For the
++            # fixed-schedule arms this is the only fit the method itself
++            # needs; it is timed into eval_fit_durations as the readout cost
++            # at the final budget.
++            gp = PartialGPSurrogate(archive_X, archive_Y)
+ 
+-            else:
+-                # Coldstart: Reinitialize model with new data (leads to random hyperparameters)
+-                gp = PartialGPSurrogate(archive_X, archive_Y)
++            if not meta_cfg.skip_fitting:
++                if meta_cfg.time_ops:
++                    start_eval_fit = time.perf_counter()
+ 
+-            if (not meta_cfg.skip_fitting) and not (
+-                is_no_refit_step
+-            ):
+                 gp.fit()
+ 
+-            else:
+-                print("waut")
++                if meta_cfg.time_ops:
++                    eval_fit_durations.append(
++                        time.perf_counter() - start_eval_fit
++                    )
+ 
+             if meta_cfg.time_ops:
+                 start_prop_post = time.perf_counter()
+ 
+-            prop_post_final = application.property_posterior(gp, noisy_variant=False, recycle= False)
++            prop_post_final = _readout_property_posterior(application, gp)
+             #Do not recycle, as acquisition optimization has not been conduced and hence some components of the property posterior are not up to date
+ 
+             if meta_cfg.time_ops:
+@@ -516,6 +623,9 @@ def run_experiment(
+         else:
+             if isinstance(acquisition_fn, LeverageGPSampler):
+                 # Hybrid case (Fit GP surrogate on samples from LeverageSHAP)
++                if meta_cfg.time_ops:
++                    start_acq_func = time.perf_counter()
++
+                 sv_approximations.append(
+                     application.get_levgp_siq_value(
+                         application.init_design_size + iteration_idx + 1,
+@@ -526,6 +636,11 @@ def run_experiment(
+                     )
+                 )
+ 
++                if meta_cfg.time_ops:
++                    acq_fun_durations.append(
++                        time.perf_counter() - start_acq_func
++                    )
++
+             else:
+                 sv_approximations.append(
+                     application.get_siq_values(
+@@ -574,6 +689,18 @@ def run_experiment(
+         prop_gt = torch.tensor(exact_siq_values).unsqueeze(dim=0)
+ 
+     # -----------------------------------------------------------------
++    # Expose the evaluated design (binary) for selection-history analysis.
++    # SHAPIQ arms manage their own design; LeverageGPSampler records the
++    # coalition matrix of its final-budget sample as archive_binary itself.
++    if not isinstance(acquisition_fn, SHAPIQAcquisitionFunction):
++        try:
++            object.__setattr__(
++                application,
++                "archive_binary",
++                gp._model.input_transform.transform(archive_X).detach(),
++            )
++        except Exception:
++            pass
+ 
+     return (
+         (
+@@ -594,9 +721,10 @@ def run_experiment(
+         ),
+         (archive_X, archive_Y),
+         (
+-            (hp_fit_durations, prop_post_durations, acq_fun_durations, peak_rss_mb)
++            (hp_fit_durations, prop_post_durations, acq_fun_durations,
++             eval_fit_durations, peak_rss_mb)
+             if meta_cfg.time_ops
+-            else (None, None, None, None)
++            else (None, None, None, None, None)
+         ),
+     )
+ 
+diff --git a/src/xac/experiments/cli.py b/src/xac/experiments/cli.py
+index b7e17de..30193b1 100644
+--- a/src/xac/experiments/cli.py
++++ b/src/xac/experiments/cli.py
+@@ -60,7 +60,8 @@ def main(cfg: DictConfig) -> None:
+         (prop_posts, prop_posts_noisy, test_predictions, test_labels, #train_labels, 
+          prop_gt, sv_approximations),
+         (archive_x, archive_y),
+-        (hp_fit_durations, prop_post_durations, acq_fun_durations, peak_rss_mb),
++        (hp_fit_durations, prop_post_durations, acq_fun_durations,
++         eval_fit_durations, peak_rss_mb),
+     ) = run_experiment(
+         application=application,
+         blackbox_fn=blackbox_fn,
+@@ -191,6 +192,7 @@ def main(cfg: DictConfig) -> None:
+                 metrics["hp_fit_duration"] = torch.tensor(hp_fit_durations)
+                 metrics["prop_post_duration"] = torch.tensor(prop_post_durations)
+                 metrics["acq_fun_duration"] = torch.tensor(acq_fun_durations)
++                metrics["eval_fit_duration"] = torch.tensor(eval_fit_durations)
+                 metrics["peak_rss_mb"] = torch.tensor(peak_rss_mb)
+ 
+ 
+@@ -285,6 +287,7 @@ def main(cfg: DictConfig) -> None:
+                 metrics["hp_fit_duration"] = metrics["hp_fit_duration"].tolist()
+                 metrics["prop_post_duration"] = metrics["prop_post_duration"].tolist()
+                 metrics["acq_fun_duration"] = metrics["acq_fun_duration"].tolist()
++                metrics["eval_fit_duration"] = metrics["eval_fit_duration"].tolist()
+                 metrics["peak_rss_mb"] = metrics["peak_rss_mb"].tolist()
+ 
+     else:
+@@ -295,6 +298,14 @@ def main(cfg: DictConfig) -> None:
+         if metrics["acq_fun_duration"] is not None:
+             metrics["acq_fun_duration"] = metrics["acq_fun_duration"].tolist()
+ 
++    if hasattr(application, "archive_binary"):
++        _ab = application.archive_binary
++        metrics["archive_sizes"] = _ab.sum(dim=1).tolist()
++        metrics["archive_masks"] = [
++            int(sum(int(round(v)) << j for j, v in enumerate(row)))
++            for row in _ab.tolist()
++        ]
++
+     (run_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
+ 
+ 
+diff --git a/src/xac/experiments/conf/repro_all_dv10.yaml b/src/xac/experiments/conf/repro_all_dv10.yaml
+new file mode 100644
+index 0000000..2b374d5
+--- /dev/null
++++ b/src/xac/experiments/conf/repro_all_dv10.yaml
+@@ -0,0 +1,62 @@
++application:
++  _target_: xac.applications.ShapiqShapleyApplication
++  init_design_factor: 1
++
++blackbox:
++  _target_: xac.blackbox_functions.ShapIQPrecomputedGameBBF
++  name: lcbench_189862
++  seed: ${meta.seed}
++
++meta:
++  _target_: xac.experiments.MetaExperimentConfig
++  seed: 0
++  debug_mode: true
++  skip_fitting: false
++  time_ops: true
++  scalability_mode: true
++
++surrogate:
++  _target_: xac.surrogates.GPSurrogateConfig
++  kernel_config:
++    _target_: xac.surrogates.HammingKernelConfig
++    min_lengthscale: 1e-6
++  missing_strategy: mean
++  warp: false
++  fit_config:
++    _target_: xac.surrogates.MLMConfig
++    optimizer: default
++    amount_restarts: 5
++    run_all_attempts: false
++    warmstart: false
++    refit_interval: 1
++  noise_config:
++    _target_: xac.surrogates.ConstantNoiseConfig
++    noise_level: 1e-6
++
++experimental_design:
++  _target_: xac.experimental_designs.ExperimentalDesignConfig
++  iterations: 512
++
++acquisition:
++  _target_: xac.acquisition_functions.EIGFunctionProperty
++
++acquisition_optimizer:
++  _target_: xac.acquisition_optimizers.Exhaustive
++
++defaults:
++  - _self_
++  - hydra/callbacks@_global_: aggregator
++  - override hydra/launcher: joblib
++
++hydra:
++  mode: MULTIRUN
++  launcher:
++    n_jobs: 90
++  sweeper:
++    params:
++      blackbox.name: dvbsgb_10,dvchgb_10,dvbsrf_10
++      acquisition._target_: xac.acquisition_functions.EIGFunctionProperty,xac.acquisition_functions.HybridPairedEIG,xac.acquisition_functions.PairedExtremes,xac.acquisition_functions.LeverageGPSampler,xac.acquisition_functions.Random
++      meta.seed: range(1,31)
++  sweep:
++    dir: multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}
++    subdir: single_runs/${hydra.job.num}
+diff --git a/src/xac/experiments/conf/repro_all_p1416.yaml b/src/xac/experiments/conf/repro_all_p1416.yaml
+new file mode 100644
+index 0000000..f3206c1
+--- /dev/null
++++ b/src/xac/experiments/conf/repro_all_p1416.yaml
+@@ -0,0 +1,63 @@
++application:
++  _target_: xac.applications.ShapiqShapleyApplication
++  init_design_factor: 1
++
++blackbox:
++  _target_: xac.blackbox_functions.ShapIQPrecomputedGameBBF
++  name: lcbench_189862
++  seed: ${meta.seed}
++
++meta:
++  _target_: xac.experiments.MetaExperimentConfig
++  seed: 0
++  debug_mode: true
++  skip_fitting: false
++  time_ops: true
++  scalability_mode: true
++
++surrogate:
++  _target_: xac.surrogates.GPSurrogateConfig
++  kernel_config:
++    _target_: xac.surrogates.HammingKernelConfig
++    min_lengthscale: 1e-6
++  missing_strategy: mean
++  warp: false
++  fit_config:
++    _target_: xac.surrogates.MLMConfig
++    optimizer: default
++    amount_restarts: 5
++    run_all_attempts: false
++    warmstart: false
++    refit_interval: 1
++  noise_config:
++    _target_: xac.surrogates.ConstantNoiseConfig
++    noise_level: 1e-6
++
++experimental_design:
++  _target_: xac.experimental_designs.ExperimentalDesignConfig
++  iterations: 512
++
++acquisition:
++  _target_: xac.acquisition_functions.EIGFunctionProperty
++
++acquisition_optimizer:
++  _target_: xac.acquisition_optimizers.Subset
++  subset_size: 1024
++
++defaults:
++  - _self_
++  - hydra/callbacks@_global_: aggregator
++  - override hydra/launcher: joblib
++
++hydra:
++  mode: MULTIRUN
++  launcher:
++    n_jobs: 60
++  sweeper:
++    params:
++      blackbox.name: resnet_14,vit_16
++      acquisition._target_: xac.acquisition_functions.EIGFunctionProperty,xac.acquisition_functions.HybridPairedEIG,xac.acquisition_functions.PairedExtremes,xac.acquisition_functions.LeverageGPSampler,xac.acquisition_functions.Random
++      meta.seed: range(1,31)
++  sweep:
++    dir: multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}
++    subdir: single_runs/${hydra.job.num}
+diff --git a/src/xac/experiments/conf/repro_all_smoke_dv10.yaml b/src/xac/experiments/conf/repro_all_smoke_dv10.yaml
+new file mode 100644
+index 0000000..5cfab15
+--- /dev/null
++++ b/src/xac/experiments/conf/repro_all_smoke_dv10.yaml
+@@ -0,0 +1,62 @@
++application:
++  _target_: xac.applications.ShapiqShapleyApplication
++  init_design_factor: 1
++
++blackbox:
++  _target_: xac.blackbox_functions.ShapIQPrecomputedGameBBF
++  name: lcbench_189862
++  seed: ${meta.seed}
++
++meta:
++  _target_: xac.experiments.MetaExperimentConfig
++  seed: 0
++  debug_mode: true
++  skip_fitting: false
++  time_ops: true
++  scalability_mode: true
++
++surrogate:
++  _target_: xac.surrogates.GPSurrogateConfig
++  kernel_config:
++    _target_: xac.surrogates.HammingKernelConfig
++    min_lengthscale: 1e-6
++  missing_strategy: mean
++  warp: false
++  fit_config:
++    _target_: xac.surrogates.MLMConfig
++    optimizer: default
++    amount_restarts: 5
++    run_all_attempts: false
++    warmstart: false
++    refit_interval: 1
++  noise_config:
++    _target_: xac.surrogates.ConstantNoiseConfig
++    noise_level: 1e-6
++
++experimental_design:
++  _target_: xac.experimental_designs.ExperimentalDesignConfig
++  iterations: 48
++
++acquisition:
++  _target_: xac.acquisition_functions.EIGFunctionProperty
++
++acquisition_optimizer:
++  _target_: xac.acquisition_optimizers.Exhaustive
++
++defaults:
++  - _self_
++  - hydra/callbacks@_global_: aggregator
++  - override hydra/launcher: joblib
++
++hydra:
++  mode: MULTIRUN
++  launcher:
++    n_jobs: 10
++  sweeper:
++    params:
++      blackbox.name: dvbsgb_10
++      acquisition._target_: xac.acquisition_functions.EIGFunctionProperty,xac.acquisition_functions.HybridPairedEIG,xac.acquisition_functions.PairedExtremes,xac.acquisition_functions.LeverageGPSampler,xac.acquisition_functions.Random
++      meta.seed: range(1,3)
++  sweep:
++    dir: multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}
++    subdir: single_runs/${hydra.job.num}
+diff --git a/src/xac/experiments/conf/repro_all_smoke_p16.yaml b/src/xac/experiments/conf/repro_all_smoke_p16.yaml
+new file mode 100644
+index 0000000..17b0ae5
+--- /dev/null
++++ b/src/xac/experiments/conf/repro_all_smoke_p16.yaml
+@@ -0,0 +1,63 @@
++application:
++  _target_: xac.applications.ShapiqShapleyApplication
++  init_design_factor: 1
++
++blackbox:
++  _target_: xac.blackbox_functions.ShapIQPrecomputedGameBBF
++  name: lcbench_189862
++  seed: ${meta.seed}
++
++meta:
++  _target_: xac.experiments.MetaExperimentConfig
++  seed: 0
++  debug_mode: true
++  skip_fitting: false
++  time_ops: true
++  scalability_mode: true
++
++surrogate:
++  _target_: xac.surrogates.GPSurrogateConfig
++  kernel_config:
++    _target_: xac.surrogates.HammingKernelConfig
++    min_lengthscale: 1e-6
++  missing_strategy: mean
++  warp: false
++  fit_config:
++    _target_: xac.surrogates.MLMConfig
++    optimizer: default
++    amount_restarts: 5
++    run_all_attempts: false
++    warmstart: false
++    refit_interval: 1
++  noise_config:
++    _target_: xac.surrogates.ConstantNoiseConfig
++    noise_level: 1e-6
++
++experimental_design:
++  _target_: xac.experimental_designs.ExperimentalDesignConfig
++  iterations: 40
++
++acquisition:
++  _target_: xac.acquisition_functions.EIGFunctionProperty
++
++acquisition_optimizer:
++  _target_: xac.acquisition_optimizers.Subset
++  subset_size: 1024
++
++defaults:
++  - _self_
++  - hydra/callbacks@_global_: aggregator
++  - override hydra/launcher: joblib
++
++hydra:
++  mode: MULTIRUN
++  launcher:
++    n_jobs: 5
++  sweeper:
++    params:
++      blackbox.name: vit_16
++      acquisition._target_: xac.acquisition_functions.EIGFunctionProperty,xac.acquisition_functions.HybridPairedEIG,xac.acquisition_functions.PairedExtremes,xac.acquisition_functions.LeverageGPSampler,xac.acquisition_functions.Random
++      meta.seed: range(1,2)
++  sweep:
++    dir: multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}
++    subdir: single_runs/${hydra.job.num}
+diff --git a/src/xac/experiments/conf/repro_all_vit9.yaml b/src/xac/experiments/conf/repro_all_vit9.yaml
+new file mode 100644
+index 0000000..bf74b65
+--- /dev/null
++++ b/src/xac/experiments/conf/repro_all_vit9.yaml
+@@ -0,0 +1,62 @@
++application:
++  _target_: xac.applications.ShapiqShapleyApplication
++  init_design_factor: 1
++
++blackbox:
++  _target_: xac.blackbox_functions.ShapIQPrecomputedGameBBF
++  name: lcbench_189862
++  seed: ${meta.seed}
++
++meta:
++  _target_: xac.experiments.MetaExperimentConfig
++  seed: 0
++  debug_mode: true
++  skip_fitting: false
++  time_ops: true
++  scalability_mode: true
++
++surrogate:
++  _target_: xac.surrogates.GPSurrogateConfig
++  kernel_config:
++    _target_: xac.surrogates.HammingKernelConfig
++    min_lengthscale: 1e-6
++  missing_strategy: mean
++  warp: false
++  fit_config:
++    _target_: xac.surrogates.MLMConfig
++    optimizer: default
++    amount_restarts: 5
++    run_all_attempts: false
++    warmstart: false
++    refit_interval: 1
++  noise_config:
++    _target_: xac.surrogates.ConstantNoiseConfig
++    noise_level: 1e-6
++
++experimental_design:
++  _target_: xac.experimental_designs.ExperimentalDesignConfig
++  iterations: 490
++
++acquisition:
++  _target_: xac.acquisition_functions.EIGFunctionProperty
++
++acquisition_optimizer:
++  _target_: xac.acquisition_optimizers.Exhaustive
++
++defaults:
++  - _self_
++  - hydra/callbacks@_global_: aggregator
++  - override hydra/launcher: joblib
++
++hydra:
++  mode: MULTIRUN
++  launcher:
++    n_jobs: 90
++  sweeper:
++    params:
++      blackbox.name: vit_9
++      acquisition._target_: xac.acquisition_functions.EIGFunctionProperty,xac.acquisition_functions.HybridPairedEIG,xac.acquisition_functions.PairedExtremes,xac.acquisition_functions.LeverageGPSampler,xac.acquisition_functions.Random
++      meta.seed: range(1,31)
++  sweep:
++    dir: multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}
++    subdir: single_runs/${hydra.job.num}
+diff --git a/src/xac/experiments/conf/repro_dv10.yaml b/src/xac/experiments/conf/repro_dv10.yaml
+new file mode 100644
+index 0000000..f78043a
+--- /dev/null
++++ b/src/xac/experiments/conf/repro_dv10.yaml
+@@ -0,0 +1,62 @@
++application:
++  _target_: xac.applications.ShapiqShapleyApplication
++  init_design_factor: 1
++
++blackbox:
++  _target_: xac.blackbox_functions.ShapIQPrecomputedGameBBF
++  name: lcbench_189862
++  seed: ${meta.seed}
++
++meta:
++  _target_: xac.experiments.MetaExperimentConfig
++  seed: 0
++  debug_mode: true
++  skip_fitting: false
++  time_ops: true
++  scalability_mode: true
++
++surrogate:
++  _target_: xac.surrogates.GPSurrogateConfig
++  kernel_config:
++    _target_: xac.surrogates.HammingKernelConfig
++    min_lengthscale: 1e-6
++  missing_strategy: mean
++  warp: false
++  fit_config:
++    _target_: xac.surrogates.MLMConfig
++    optimizer: default
++    amount_restarts: 5
++    run_all_attempts: false
++    warmstart: false
++    refit_interval: 1
++  noise_config:
++    _target_: xac.surrogates.ConstantNoiseConfig
++    noise_level: 1e-6
++    
++experimental_design:
++  _target_: xac.experimental_designs.ExperimentalDesignConfig
++  iterations: 512
++
++acquisition:
++  _target_: xac.acquisition_functions.EIGFunctionProperty
++
++acquisition_optimizer:
++  _target_: xac.acquisition_optimizers.Exhaustive
++
++defaults:
++  - _self_
++  - hydra/callbacks@_global_: aggregator
++  - override hydra/launcher: joblib
++
++hydra:
++  mode: MULTIRUN
++  launcher:
++    n_jobs: 100
++  sweeper:
++    params:
++      blackbox.name: dvbsgb_10,dvchgb_10,dvbsrf_10
++      acquisition._target_: xac.acquisition_functions.EIGFunctionProperty,xac.acquisition_functions.Random,xac.acquisition_functions.LeverageGPSampler,xac.acquisition_functions.PairedExtremes
++      meta.seed: range(1,31)
++  sweep:
++    dir: multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}
++    subdir: single_runs/${hydra.job.num}
+\ No newline at end of file
+diff --git a/src/xac/experiments/conf/repro_dv10_hybrid.yaml b/src/xac/experiments/conf/repro_dv10_hybrid.yaml
+new file mode 100644
+index 0000000..665f6f1
+--- /dev/null
++++ b/src/xac/experiments/conf/repro_dv10_hybrid.yaml
+@@ -0,0 +1,63 @@
++application:
++  _target_: xac.applications.ShapiqShapleyApplication
++  init_design_factor: 1
++
++blackbox:
++  _target_: xac.blackbox_functions.ShapIQPrecomputedGameBBF
++  name: lcbench_189862
++  seed: ${meta.seed}
++
++meta:
++  _target_: xac.experiments.MetaExperimentConfig
++  seed: 0
++  debug_mode: true
++  skip_fitting: false
++  time_ops: true
++  scalability_mode: true
++
++surrogate:
++  _target_: xac.surrogates.GPSurrogateConfig
++  kernel_config:
++    _target_: xac.surrogates.HammingKernelConfig
++    min_lengthscale: 1e-6
++  missing_strategy: mean
++  warp: false
++  fit_config:
++    _target_: xac.surrogates.MLMConfig
++    optimizer: default
++    amount_restarts: 5
++    run_all_attempts: false
++    warmstart: false
++    refit_interval: 1
++    refit_schedule: geometric
++  noise_config:
++    _target_: xac.surrogates.ConstantNoiseConfig
++    noise_level: 1e-6
++    
++experimental_design:
++  _target_: xac.experimental_designs.ExperimentalDesignConfig
++  iterations: 512
++
++acquisition:
++  _target_: xac.acquisition_functions.EIGFunctionProperty
++
++acquisition_optimizer:
++  _target_: xac.acquisition_optimizers.Exhaustive
++
++defaults:
++  - _self_
++  - hydra/callbacks@_global_: aggregator
++  - override hydra/launcher: joblib
++
++hydra:
++  mode: MULTIRUN
++  launcher:
++    n_jobs: 90
++  sweeper:
++    params:
++      blackbox.name: dvbsgb_10,dvchgb_10,dvbsrf_10
++      acquisition._target_: xac.acquisition_functions.HybridPairedEIG
++      meta.seed: range(1,31)
++  sweep:
++    dir: multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}
++    subdir: single_runs/${hydra.job.num}
+\ No newline at end of file
+diff --git a/src/xac/experiments/conf/repro_dv10_hybrid_smoke.yaml b/src/xac/experiments/conf/repro_dv10_hybrid_smoke.yaml
+new file mode 100644
+index 0000000..c7e903d
+--- /dev/null
++++ b/src/xac/experiments/conf/repro_dv10_hybrid_smoke.yaml
+@@ -0,0 +1,62 @@
++application:
++  _target_: xac.applications.ShapiqShapleyApplication
++  init_design_factor: 1
++
++blackbox:
++  _target_: xac.blackbox_functions.ShapIQPrecomputedGameBBF
++  name: lcbench_189862
++  seed: ${meta.seed}
++
++meta:
++  _target_: xac.experiments.MetaExperimentConfig
++  seed: 0
++  debug_mode: true
++  skip_fitting: false
++  time_ops: true
++  scalability_mode: true
++
++surrogate:
++  _target_: xac.surrogates.GPSurrogateConfig
++  kernel_config:
++    _target_: xac.surrogates.HammingKernelConfig
++    min_lengthscale: 1e-6
++  missing_strategy: mean
++  warp: false
++  fit_config:
++    _target_: xac.surrogates.MLMConfig
++    optimizer: default
++    amount_restarts: 5
++    run_all_attempts: false
++    warmstart: false
++    refit_interval: 32
++  noise_config:
++    _target_: xac.surrogates.ConstantNoiseConfig
++    noise_level: 1e-6
++    
++experimental_design:
++  _target_: xac.experimental_designs.ExperimentalDesignConfig
++  iterations: 48
++
++acquisition:
++  _target_: xac.acquisition_functions.EIGFunctionProperty
++
++acquisition_optimizer:
++  _target_: xac.acquisition_optimizers.Exhaustive
++
++defaults:
++  - _self_
++  - hydra/callbacks@_global_: aggregator
++  - override hydra/launcher: joblib
++
++hydra:
++  mode: MULTIRUN
++  launcher:
++    n_jobs: 6
++  sweeper:
++    params:
++      blackbox.name: dvbsrf_10
++      acquisition._target_: xac.acquisition_functions.HybridPairedEIG
++      meta.seed: range(1,3)
++  sweep:
++    dir: multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}
++    subdir: single_runs/${hydra.job.num}
+\ No newline at end of file
+diff --git a/src/xac/experiments/conf/repro_dv10_smoke.yaml b/src/xac/experiments/conf/repro_dv10_smoke.yaml
+new file mode 100644
+index 0000000..f12c441
+--- /dev/null
++++ b/src/xac/experiments/conf/repro_dv10_smoke.yaml
+@@ -0,0 +1,62 @@
++application:
++  _target_: xac.applications.ShapiqShapleyApplication
++  init_design_factor: 1
++
++blackbox:
++  _target_: xac.blackbox_functions.ShapIQPrecomputedGameBBF
++  name: lcbench_189862
++  seed: ${meta.seed}
++
++meta:
++  _target_: xac.experiments.MetaExperimentConfig
++  seed: 0
++  debug_mode: true
++  skip_fitting: false
++  time_ops: true
++  scalability_mode: true
++
++surrogate:
++  _target_: xac.surrogates.GPSurrogateConfig
++  kernel_config:
++    _target_: xac.surrogates.HammingKernelConfig
++    min_lengthscale: 1e-6
++  missing_strategy: mean
++  warp: false
++  fit_config:
++    _target_: xac.surrogates.MLMConfig
++    optimizer: default
++    amount_restarts: 5
++    run_all_attempts: false
++    warmstart: false
++    refit_interval: 1
++  noise_config:
++    _target_: xac.surrogates.ConstantNoiseConfig
++    noise_level: 1e-6
++    
++experimental_design:
++  _target_: xac.experimental_designs.ExperimentalDesignConfig
++  iterations: 8
++
++acquisition:
++  _target_: xac.acquisition_functions.EIGFunctionProperty
++
++acquisition_optimizer:
++  _target_: xac.acquisition_optimizers.Exhaustive
++
++defaults:
++  - _self_
++  - hydra/callbacks@_global_: aggregator
++  - override hydra/launcher: joblib
++
++hydra:
++  mode: MULTIRUN
++  launcher:
++    n_jobs: 8
++  sweeper:
++    params:
++      blackbox.name: dvbsrf_10
++      acquisition._target_: xac.acquisition_functions.EIGFunctionProperty,xac.acquisition_functions.Random,xac.acquisition_functions.LeverageGPSampler,xac.acquisition_functions.PairedExtremes
++      meta.seed: range(1,3)
++  sweep:
++    dir: multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}
++    subdir: single_runs/${hydra.job.num}
+\ No newline at end of file
+diff --git a/src/xac/surrogates/gp_surrogate.py b/src/xac/surrogates/gp_surrogate.py
+index a373082..defb9f1 100644
+--- a/src/xac/surrogates/gp_surrogate.py
++++ b/src/xac/surrogates/gp_surrogate.py
+@@ -133,7 +133,7 @@ class MLMConfig(FitConfig):
+     run_all_attempts: int = False
+     warmstart: bool = False
+     refit_interval: int = 1 #Indicates how often HPs are refitted
+-    refit_schedule: Optional[Literal["init_64_factor_4"]] = None
++    refit_schedule: Optional[Literal["init_64_factor_4", "geometric"]] = None
+ 
+ 
+ @dataclass(frozen=True)
