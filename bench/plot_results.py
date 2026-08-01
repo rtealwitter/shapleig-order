@@ -34,7 +34,7 @@ def quantiles(res, method, key):
 
 
 def main():
-    for path in sorted(glob.glob(os.path.join(HERE, "results_*.json"))):
+    for path in sorted(glob.glob(os.path.join(HERE, "results", "results_*.json"))):
         name = os.path.basename(path)[len("results_"):-len(".json")]
         with open(path) as f:
             res = json.load(f)
@@ -64,13 +64,14 @@ def main():
         fig.suptitle(f"{name}  (d = {d}, 8 seeds, median with 20–80% band)",
                      fontsize=11)
         for ext in ("png", "svg"):
-            fig.savefig(os.path.join(HERE, "figures", "bench", f"bench_{name}.{ext}"), dpi=180)
+            fig.savefig(os.path.join(HERE, "..", "figures", "bench",
+                                     f"bench_{name}.{ext}"), dpi=180)
         plt.close(fig)
         print(f"plotted {name}")
 
     # console summary: error at the largest common m, plus fitted-lengthscale spread
     print("\nsummary (median rel. error at largest m):")
-    for path in sorted(glob.glob(os.path.join(HERE, "results_*.json"))):
+    for path in sorted(glob.glob(os.path.join(HERE, "results", "results_*.json"))):
         name = os.path.basename(path)[len("results_"):-len(".json")]
         with open(path) as f:
             res = json.load(f)

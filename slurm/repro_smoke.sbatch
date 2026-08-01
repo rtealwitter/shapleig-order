@@ -23,7 +23,7 @@ echo "[$(date)] node $(hostname)"
 if [ ! -f data/paired_schedule_p10.npy ]; then
   $PY - <<'EOF'
 import sys
-sys.path.insert(0, "/hopper/groups/witterlab/rwitter/scratch/shapleig-order")
+sys.path.insert(0, "/hopper/groups/witterlab/rwitter/scratch/shapleig-order/greedy")
 import numpy as np
 from gp_core import fixed_schedule
 s = fixed_schedule(10, 512)

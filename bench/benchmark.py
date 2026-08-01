@@ -9,8 +9,12 @@
 # Resumable per game: writes results_<game>.json.
 import json
 import os
+import sys
 import time
 import numpy as np
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "..", "greedy"))
 from gp_core import (membership, shapley_A, AH_matrix, fit_gp, shapley_estimate,
                      eig_scores, fixed_schedule, self_test)
 
@@ -134,13 +138,15 @@ def main():
         if not fname.endswith(".npz"):
             continue
         name = fname[:-4]
-        out = os.path.join(HERE, f"results_{name}.json")
+        os.makedirs(os.path.join(HERE, "results"), exist_ok=True)
+        os.makedirs(os.path.join(HERE, "schedules"), exist_ok=True)
+        out = os.path.join(HERE, "results", f"results_{name}.json")
         if os.path.exists(out):
             print(f"skip {name} (results exist)")
             continue
         tab = np.load(os.path.join(GAMES_DIR, fname))
         d = int(tab["d"])
-        sched_path = os.path.join(HERE, f"schedule_d{d}.npy")
+        sched_path = os.path.join(HERE, "schedules", f"schedule_d{d}.npy")
         if os.path.exists(sched_path):
             schedule = np.load(sched_path)
         else:

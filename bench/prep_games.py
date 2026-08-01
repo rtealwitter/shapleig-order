@@ -5,7 +5,11 @@
 # computed densely. Resumable: skips games whose npz already exists.
 import numpy as np
 import os
+import sys
 import time
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "..", "greedy"))
 from gp_core import membership, shapley_A
 
 OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "games")

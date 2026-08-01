@@ -15,5 +15,5 @@
 
 source ~/.bashrc
 echo "[$(date)] node $(hostname) python $(command -v python)"
-python /hopper/groups/witterlab/rwitter/scratch/shapleig-order/greedy_order.py
+python /hopper/groups/witterlab/rwitter/scratch/shapleig-order/greedy/greedy_order.py
 echo "[$(date)] done rc=$?"

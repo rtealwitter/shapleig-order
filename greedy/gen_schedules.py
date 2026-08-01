@@ -14,7 +14,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from gp_core import fixed_schedule
 
-OUT = os.path.join(HERE, "shapleig-repo", "data")
+OUT = os.path.join(HERE, "..", "shapleig-repo", "data")
 TARGETS = {9: 512, 14: 600, 16: 600}  # p -> schedule length
 
 for p, m_max in TARGETS.items():

@@ -12,7 +12,7 @@
 #SBATCH --output=/hopper/groups/witterlab/rwitter/scratch/shapleig-order/bench_%j.out
 
 source ~/.bashrc
-cd /hopper/groups/witterlab/rwitter/scratch/shapleig-order
+cd /hopper/groups/witterlab/rwitter/scratch/shapleig-order/bench
 PY=/hopper/groups/witterlab/rwitter/scratch/shapleig-order/.venv/bin/python
 export MPLBACKEND=Agg
 

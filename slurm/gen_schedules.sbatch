@@ -17,6 +17,6 @@ PY=/hopper/groups/witterlab/rwitter/scratch/shapleig-order/.venv-repro/bin/pytho
 export OMP_NUM_THREADS=8
 
 echo "[$(date)] node $(hostname) generating schedules"
-$PY /hopper/groups/witterlab/rwitter/scratch/shapleig-order/gen_schedules.py
+$PY /hopper/groups/witterlab/rwitter/scratch/shapleig-order/greedy/gen_schedules.py
 echo "[$(date)] done rc=$?"
 ls -la /hopper/groups/witterlab/rwitter/scratch/shapleig-order/shapleig-repo/data/

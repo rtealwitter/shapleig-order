@@ -75,13 +75,15 @@ locally precomputed games.
     sampled design, so it appears in all three figure panels;
   - sweep configs `src/xac/experiments/conf/repro_all_*.yaml`.
 - `repro_plots.py` — aggregates hydra multiruns into `figures/`.
-- `gp_core.py`, `efficient_greedy.py`, `greedy_order.py` — standalone
-  frozen-kernel greedy: dense reference, poly-time orbit version, closed-form
-  validation.
-- `gen_schedules.py` — writes `shapleig-repo/data/paired_schedule_p{9,14,16}.npy`
-  (p=10 is committed).
-- `prep_games.py`, `benchmark.py`, `plot_results.py`, `smoke.py` — standalone
-  benchmark on locally precomputed games in `games/`.
+- `greedy/` — the frozen-kernel greedy itself: `gp_core.py` (dense
+  reference implementation and self-tests), `efficient_greedy.py`
+  (poly-time orbit version with closed-form validation), `greedy_order.py`
+  (order experiments), and `gen_schedules.py`, which writes
+  `shapleig-repo/data/paired_schedule_p{9,14,16}.npy` (p=10 is committed).
+- `bench/` — standalone benchmark on locally precomputed games:
+  `prep_games.py` builds `bench/games/`, `benchmark.py` writes
+  `bench/results/` (schedules cached in `bench/schedules/`), and
+  `plot_results.py` renders `figures/bench/`.
 - `slurm/` — Slurm wrappers (schedules, smoke, full sweeps, aggregation);
   job logs go to `run_logs/` (not tracked).
 

@@ -1,6 +1,12 @@
 # Fast end-to-end smoke test: gp_core self-tests, then the full benchmark path
 # on a synthetic d=8 game with 2 seeds and a short grid.
+import os
+import sys
+
 import numpy as np
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "..", "greedy"))
 import benchmark as B
 from gp_core import self_test, fixed_schedule, membership, shapley_A
 
