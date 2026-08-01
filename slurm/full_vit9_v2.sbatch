@@ -11,7 +11,7 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=90
-#SBATCH --mem=120gb
+#SBATCH --mem=200gb
 #SBATCH --time=06:00:00
 #SBATCH --job-name=shapleig-full-vit9-v2
 #SBATCH --output=/hopper/groups/witterlab/rwitter/scratch/shapleig-order/run_logs/full_vit9_v2_%j.out
