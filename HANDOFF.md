@@ -128,13 +128,22 @@ explicitly asked for the notification).
    its own. **Confirmed this actually happened**: the first dv10 OOM
    crash (267675) recorded a directory that, on inspection, held a mix of
    dv10 *and* vit_16 data from a job that started around the same time.
-   Fixed the detection in all three fastfit sbatch scripts to snapshot
-   `multirun/` before/after and diff (`comm -13`) — robust regardless of
-   what else is running. **This bug also exists, unfixed, in the
-   original, unmodified `full_*_v2.sbatch` scripts** (not touched, out of
-   scope) — the original baseline data was checked and is clean (lucky
-   timing), but be aware of this if anyone launches multiple `full_*`
-   jobs concurrently in the future.
+
+   First fix attempt (snapshotting `multirun/` before/after and diffing
+   with `comm -13`) turned out **not** to be robust: it still infers the
+   right directory from what's merely *new*, so two jobs launched inside
+   the same wall-clock second can both see each other's directory as
+   "new" and pick the wrong one. **Confirmed this happened too**: the
+   267757 dv10 resubmit's own log recorded `15-19-14`, which was actually
+   vit_9's directory (267758) — harmless that time only because vit_9's
+   own script happened to log the same, correct path independently.
+
+   **Real fix (now in all six `full_*.sbatch` scripts, fastfit and
+   original)**: pass `hydra.sweep.dir=multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}-$SLURM_JOB_ID`
+   so each job's directory name is unique by construction — no inference,
+   no diffing, no race regardless of how many jobs start in the same
+   second. Root detection afterward is just `find multirun -mindepth 2
+   -maxdepth 2 -type d -name "*-${SLURM_JOB_ID}"`.
 
    Because of bug 4, `sweep_roots_v2.txt` was manually cleaned: removed
    the two lines pointing at the corrupted `multirun/2026-08-12/13-15-09`

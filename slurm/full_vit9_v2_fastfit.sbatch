@@ -23,26 +23,23 @@ export MKL_NUM_THREADS=1
 export WANDB_MODE=disabled
 export MPLBACKEND=Agg
 
-# `ls -td multirun/*/* | head -1` picks the most-recently-*created*
-# directory across the whole shared multirun/ tree, so it silently grabs
-# another concurrently-running job's fresh directory instead of this run's
-# own if one was created after this job's -- confirmed in practice on the
-# dv10 companion script. Snapshot before/after and diff to identify this
-# invocation's own directory regardless of what else is running.
-before=$(mktemp)
-find multirun -mindepth 2 -maxdepth 2 -type d 2>/dev/null | sort > "$before"
-
+# `ls -td multirun/*/* | head -1`, and even the before/after snapshot-diff
+# that replaced it, both infer this run's own directory from what's new in
+# the shared multirun/ tree -- and that inference still collides when two
+# jobs are submitted within the same wall-clock second (confirmed on the
+# dv10 companion script: two sibling jobs' directories both appeared
+# inside the same before/after window). Suffixing hydra's own sweep dir
+# with this job's SLURM_JOB_ID makes the directory name unique by
+# construction, so there is nothing left to infer or race.
 echo "[$(date)] node $(hostname) starting vit_9 fast-fit sweep (60 jobs)"
-$PY -m xac.experiments.cli --config-path conf --config-name repro_all_vit9_fastfit
+$PY -m xac.experiments.cli --config-path conf --config-name repro_all_vit9_fastfit \
+    hydra.sweep.dir='multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}-'"$SLURM_JOB_ID"
 rc=$?
 echo "[$(date)] sweep done rc=$rc"
 
-after=$(mktemp)
-find multirun -mindepth 2 -maxdepth 2 -type d 2>/dev/null | sort > "$after"
-latest=$(comm -13 "$before" "$after" | head -1)
-rm -f "$before" "$after"
+latest=$(find multirun -mindepth 2 -maxdepth 2 -type d -name "*-${SLURM_JOB_ID}" 2>/dev/null | head -1)
 if [ -z "$latest" ]; then
-    echo "[$(date)] WARNING: could not identify this run's own multirun dir; not recording a root."
+    echo "[$(date)] WARNING: could not find this job's own multirun dir (looked for *-${SLURM_JOB_ID}); not recording a root."
 else
     echo "$PWD/$latest" >> /hopper/groups/witterlab/rwitter/scratch/shapleig-order/sweep_roots_v2.txt
     echo "[$(date)] root recorded: $latest"

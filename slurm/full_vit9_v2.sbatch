@@ -25,10 +25,23 @@ export MKL_NUM_THREADS=1
 export WANDB_MODE=disabled
 export MPLBACKEND=Agg
 
+# `ls -td multirun/*/* | head -1` picks the most-recently-*created*
+# directory across the whole shared multirun/ tree, so it silently grabs
+# another concurrently-running job's fresh directory instead of this run's
+# own if one was created after this job's -- confirmed in practice on the
+# fastfit companion scripts. Suffixing hydra's own sweep dir with this
+# job's SLURM_JOB_ID makes the directory name unique by construction, so
+# there is nothing left to infer or race.
 echo "[$(date)] node $(hostname) starting vit_9 sweep (150 jobs)"
-$PY -m xac.experiments.cli --config-path conf --config-name repro_all_vit9
+$PY -m xac.experiments.cli --config-path conf --config-name repro_all_vit9 \
+    hydra.sweep.dir='multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}-'"$SLURM_JOB_ID"
 rc=$?
 echo "[$(date)] sweep done rc=$rc"
-latest=$(ls -td multirun/*/* | head -1)
-echo "$PWD/$latest" >> /hopper/groups/witterlab/rwitter/scratch/shapleig-order/sweep_roots_v2.txt
-echo "[$(date)] root recorded: $latest"
+
+latest=$(find multirun -mindepth 2 -maxdepth 2 -type d -name "*-${SLURM_JOB_ID}" 2>/dev/null | head -1)
+if [ -z "$latest" ]; then
+    echo "[$(date)] WARNING: could not find this job's own multirun dir (looked for *-${SLURM_JOB_ID}); not recording a root."
+else
+    echo "$PWD/$latest" >> /hopper/groups/witterlab/rwitter/scratch/shapleig-order/sweep_roots_v2.txt
+    echo "[$(date)] root recorded: $latest"
+fi
