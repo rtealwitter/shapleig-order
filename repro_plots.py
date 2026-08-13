@@ -35,8 +35,18 @@ ARMS = {
         ("GP + Leverage Score Sampling", "#7c3aed"),
     "xac.acquisition_functions.Random":
         ("GP + Random", "#be185d"),
+    # Fast-fit variants: same acquisition/selection logic, but every GP fit
+    # goes through AcceleratedFitConfig (CG/Lanczos + inducing-point
+    # transplant + odd-part folding, src/xac/surrogates/fast_fit.py)
+    # instead of the exact MLM fit -- see collect() below for the
+    # "+fast" suffix that distinguishes them from their exact counterparts.
+    "xac.acquisition_functions.PairedExtremes+fast":
+        ("Non-adaptive, fast fit (CG+ind.pts+odd)", "#059669"),
+    "xac.acquisition_functions.HybridPairedEIG+fast":
+        ("Hybrid + fast fit (CG+ind.pts+odd)", "#4338ca"),
 }
 LEVGP = "xac.acquisition_functions.LeverageGPSampler"
+FAST_FIT_TARGET_SUFFIX = "AcceleratedFitConfig"
 GAME_ORDER = ["vit_9", "dvbsgb_10", "dvbsrf_10", "dvchgb_10",
               "resnet_14", "vit_16"]  # rows in increasing p
 GAME_TITLES = {"dvbsrf_10": "DV; RF; Bike Sharing (p=10)",
@@ -71,6 +81,11 @@ def collect(roots):
             with open(mpath) as f:
                 met = json.load(f)
             acq = cfg["acquisition"]["_target_"]
+            fit_target = (
+                cfg.get("surrogate", {}).get("fit_config", {}).get("_target_", "")
+            )
+            if fit_target.endswith(FAST_FIT_TARGET_SUFFIX):
+                acq = acq + "+fast"
 
             def arr(key):
                 v = met.get(key)

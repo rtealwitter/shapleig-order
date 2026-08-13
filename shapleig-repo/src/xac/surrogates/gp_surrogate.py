@@ -684,6 +684,20 @@ class GPSurrogate:
         else:
             mll = ExactMarginalLogLikelihood(self._model.likelihood, self._model)
 
+            from .fast_fit import AcceleratedFitConfig  # local: avoids a cycle at import time
+
+            if isinstance(self.config.fit_config, AcceleratedFitConfig):
+                from .fast_fit import fit_accelerated
+
+                try:
+                    fit_accelerated(self)
+                    return
+                except Exception:
+                    log.exception(
+                        "Accelerated fit failed; falling back to the exact MLM fit."
+                    )
+                    # Fall through to the ordinary path below.
+
             if self.config.fit_config.optimizer == "default":
                 optimizer = None
                 optimizer_kwargs = None
