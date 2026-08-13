@@ -32,6 +32,7 @@ surrogate:
     use_iterative: true
     inducing_points: null
     fold_odd_part: true
+    max_optimizer_evals: 250
   noise_config:
     _target_: xac.surrogates.ConstantNoiseConfig
     noise_level: 1e-6

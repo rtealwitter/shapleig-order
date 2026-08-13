@@ -55,6 +55,31 @@ and (2) actually get used here, versus how they're usually pitched:
   full kernel. On an unfolded archive this module falls back to an
   ordinary direct fit: the same cost the exact baseline already pays
   successfully at that size, so no acceleration but no regression either.
+- **(6) The auxiliary optimizer's L-BFGS-B evaluation budget is capped**
+  (``max_optimizer_evals``). Measurement on real archives found the
+  folded odd-part likelihood surface is sometimes far *harder* to optimize
+  than the exact model's: on a resnet_14 archive at t=527, the exact fit
+  converges in 229 scipy L-BFGS-B function evaluations, but the folded
+  auxiliary model needed 1389 to hit the same strict convergence tolerance
+  -- the ~3-4x per-evaluation saving from halving the matrix (odd-part
+  folding) was completely swamped by needing 6x more evaluations, making
+  the "accelerated" fit 1.7x *slower* than the exact one overall (the
+  regression this technique exists to fix). This wasn't about CG/Lanczos
+  vs. direct Cholesky -- capping ``max_cholesky_size`` made no measurable
+  difference; it was specifically that L-BFGS-B needed many more steps on
+  this landscape. The same archive on vit_16, by contrast, converges in a
+  landscape well-behaved enough that a cap of 250 never even binds. A cap
+  around 150-250 was measured to bound the resulting kernel matrix's
+  relative Frobenius drift from the fully-converged optimum to roughly
+  9-10% on the worst case seen (resnet_14) while being a complete no-op
+  everywhere the landscape is already easy (confirmed: this is what
+  downstream ``.fit()`` calls are willing to trade for a 10-30x speedup on
+  the archives where it binds). It is intentionally not disabled by
+  default (unlike inducing points): the failure mode it targets --
+  drastically more optimizer evaluations needed on an otherwise cheap
+  reduced system -- is much less predictable per-game than "archive size,"
+  so leaving it uncapped is a worse default than the two ends of that
+  measured tradeoff.
 
 Each technique falls back gracefully rather than raising: folding is
 skipped when the archive is not complement-paired, and the whole
@@ -107,6 +132,7 @@ class AcceleratedFitConfig(MLMConfig):
     use_iterative: bool = True  # (2) CG + Lanczos via max_cholesky_size(0)
     inducing_points: Optional[int] = None  # (3) m << t; None disables (see above)
     fold_odd_part: bool = True  # (5) complement-paired archives only
+    max_optimizer_evals: Optional[int] = 250  # (6) L-BFGS-B maxfun cap; see below
 
 
 class OddKernel(Kernel):
@@ -301,9 +327,24 @@ def _fit_accelerated_inner(surrogate, cfg: AcceleratedFitConfig, model) -> None:
     # already-halved folded system.
     force_iterative = cfg.use_iterative and not used_inducing and used_fold
     cholesky_size = 0 if force_iterative else gpytorch.settings.max_cholesky_size.value()
+    # (6) See the module docstring: on some games the folded likelihood
+    # surface needs far more L-BFGS-B evaluations than the exact fit to
+    # reach the same strict convergence tolerance, which can make the
+    # "accelerated" fit slower than what it's replacing. Capping maxfun
+    # bounds that regression; each attempt still retries up to
+    # amount_restarts times on outright failure, independent of this cap.
+    optimizer_kwargs = None
+    if cfg.max_optimizer_evals is not None:
+        optimizer_kwargs = {
+            "options": {
+                "maxiter": cfg.max_optimizer_evals,
+                "maxfun": cfg.max_optimizer_evals + 20,
+            }
+        }
     with gpytorch.settings.max_cholesky_size(cholesky_size):
         fit_gpytorch_mll(
-            mll, max_attempts=cfg.amount_restarts, pick_best_of_all_attempts=False
+            mll, max_attempts=cfg.amount_restarts, pick_best_of_all_attempts=False,
+            optimizer_kwargs=optimizer_kwargs,
         )
 
     fitted_base = _find_categorical_kernel(covar_module)
