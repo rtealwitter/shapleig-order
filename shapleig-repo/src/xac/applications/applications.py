@@ -44,6 +44,29 @@ from .regressionMSR import RegressionMSR
 
 log = logging.getLogger(__name__)
 
+# ShapleyApplication._cholesky_maybe_incremental: each bordered Cholesky
+# update is an exact algebraic identity, but float64 rounding still
+# accumulates across a chain of them, and HybridPairedEIG's greedy
+# selection is sensitive enough that a long enough chain will eventually
+# flip a near-tied decision, branching the archive trajectory from that
+# point on (confirmed on a real 450-iteration run). This is NOT a
+# correctness bug -- a multi-seed, real-scale (resnet_14, 512 iterations)
+# comparison of forced-full vs. incremental showed aggregate MSE
+# statistically unchanged (0.07 SEM-normalized difference) despite
+# individual-seed trajectories branching, matching how the existing
+# fast-fit path already accepts different-but-equally-valid trajectories
+# from using different hyperparameters. What this cap actually guards
+# against is pathological numerical blowup (see the non-positive-pivot
+# check below), not "the archive doesn't match" -- a small cap (20) was
+# tried first and measured to throttle away nearly all the speedup at
+# t~500 (a single O(t^3) refactorization there costs ~26x what 19 O(t^2)
+# updates cost combined, so resetting every 20 steps pays almost the
+# full O(t^3) price anyway). The refit schedule already forces periodic
+# full recomputes on its own (is_no_refit_step=False resets the chain
+# unconditionally); this cap is a backstop against pathologically long
+# refit-free stretches, not the primary reset mechanism.
+_MAX_INCREMENTAL_CHOLESKY_CHAIN = 200
+
 # -----------------------------------------------------------------------------
 # Abstract parent
 # -----------------------------------------------------------------------------
@@ -1452,7 +1475,7 @@ class ShapleyApplication(BaseApplication):
         #In case of no refit step, we could also update K_XW from previous step by removing one column
 
         # 2.4: Solve LES
-        inv_K_XX_A_KZX = K_XX_noisy.solve(A_KZX.T)
+        inv_K_XX_A_KZX = self._solve_against_cached_cholesky(surrogate, K_XX_noisy, A_KZX.T)
 
         A_KZX_inv_K_XX_K_XW = inv_K_XX_A_KZX.T @ K_XW
 
@@ -1469,6 +1492,110 @@ class ShapleyApplication(BaseApplication):
 
         return ASigmaW
 
+    @torch.no_grad()
+    def _solve_against_cached_cholesky(self, surrogate, K_XX_noisy, rhs):
+        """``C^{-1} @ rhs`` reusing the Cholesky factor ``_cholesky_maybe_incremental``
+        cached in ``self._L_cache`` while computing ``compute_AEA_new``'s own
+        ``AEA``, instead of ``K_XX_noisy.solve(rhs)`` factorizing the exact
+        same ``t x t`` matrix a second time. ``compute_ASigmaW_new`` (this
+        method's only caller) always runs immediately after
+        ``compute_AEA_new`` within the same ``EIGFunctionProperty.__call__``,
+        so the cache is guaranteed fresh for the current archive whenever
+        this runs -- confirmed the sole call site via grep, not assumed.
+
+        Gated to ``AcceleratedFitConfig`` for the same reason as
+        ``_cholesky_maybe_incremental``: keep the exact baseline's own
+        numbers and timing untouched. Falls back to the original
+        ``K_XX_noisy.solve(rhs)`` whenever the cache is missing, stale, or
+        the solve fails.
+        """
+        from ..surrogates.fast_fit import AcceleratedFitConfig  # local: avoid import cycle
+
+        cached_L = getattr(self, "_L_cache", None)
+        if (
+            cached_L is not None
+            and cached_L.shape[-1] == rhs.shape[0]
+            and isinstance(surrogate.config.fit_config, AcceleratedFitConfig)
+        ):
+            try:
+                return torch.cholesky_solve(rhs, cached_L, upper=False)
+            except Exception:
+                log.exception(
+                    "Cached-Cholesky solve failed; falling back to "
+                    "K_XX_noisy.solve()."
+                )
+        return K_XX_noisy.solve(rhs)
+
+    @torch.no_grad()
+    def _cholesky_maybe_incremental(
+        self, surrogate, C, is_no_refit_step: bool
+    ) -> torch.Tensor:
+        """``L`` with ``C = L L^T`` for ``compute_AEA_new``.
+
+        ``EIGFunctionProperty.__call__`` calls ``compute_AEA_new`` every
+        iteration, refit or not, and on a no-refit step the archive has
+        grown by exactly one point (appended last) with hyperparameters
+        unchanged since the previous call -- so ``C`` differs from the
+        previous call's ``C`` by one new row/column only. Given the
+        previous factor ``C_prev = L_prev L_prev^T`` and the bordered
+        matrix ``C = [[C_prev, c], [c^T, c_nn]]``, the updated factor is
+        ``L = [[L_prev, 0], [l^T, l_nn]]`` with ``l = L_prev^{-1} c`` (one
+        triangular solve, O(t^2)) and ``l_nn = sqrt(c_nn - l^T l)`` -- an
+        exact algebraic identity, not an approximation, replacing an O(t^3)
+        refactorization from scratch every iteration with an O(t^2) update.
+
+        Gated to ``AcceleratedFitConfig`` surrogates only, so the exact
+        baseline arms (ShaplEIG, exact Hybrid) are untouched and keep doing
+        a full factorization every call. Falls back to that same full
+        factorization whenever the cache is missing, stale (size doesn't
+        match archive growth by exactly one), the chain has run
+        ``_MAX_INCREMENTAL_CHOLESKY_CHAIN`` updates since its last full
+        refactorization (bounds accumulated float64 drift -- see that
+        constant's comment), or the update produces a non-positive pivot
+        (would indicate numerical trouble, not just slow) -- this must
+        never be the source of a crashed sweep.
+        """
+        from ..surrogates.fast_fit import AcceleratedFitConfig  # local: avoid import cycle
+
+        t = C.shape[-1]
+        cached_L = getattr(self, "_L_cache", None)
+        chain_len = getattr(self, "_L_cache_chain_len", 0)
+        if (
+            is_no_refit_step
+            and cached_L is not None
+            and cached_L.shape[-1] == t - 1
+            and chain_len < _MAX_INCREMENTAL_CHOLESKY_CHAIN
+            and isinstance(surrogate.config.fit_config, AcceleratedFitConfig)
+        ):
+            try:
+                C_dense = C.to_dense()
+                c = C_dense[:-1, -1].unsqueeze(-1)
+                c_nn = C_dense[-1, -1]
+                l_vec = torch.linalg.solve_triangular(
+                    cached_L, c, upper=False
+                ).squeeze(-1)
+                l_nn_sq = c_nn - l_vec @ l_vec
+                if l_nn_sq <= 0:
+                    msg = "non-positive pivot in incremental Cholesky update"
+                    raise ValueError(msg)
+                l_nn = torch.sqrt(l_nn_sq)
+                L = torch.zeros((t, t), dtype=cached_L.dtype, device=cached_L.device)
+                L[:-1, :-1] = cached_L
+                L[-1, :-1] = l_vec
+                L[-1, -1] = l_nn
+                object.__setattr__(self, "_L_cache", L)
+                object.__setattr__(self, "_L_cache_chain_len", chain_len + 1)
+                return L
+            except Exception:
+                log.exception(
+                    "Incremental Cholesky update failed; falling back to full "
+                    "factorization."
+                )
+
+        L = psd_safe_cholesky(C.to_dense())
+        object.__setattr__(self, "_L_cache", L)
+        object.__setattr__(self, "_L_cache_chain_len", 0)
+        return L
 
     @torch.no_grad()
     def compute_AEA_new(
@@ -1485,7 +1612,7 @@ class ShapleyApplication(BaseApplication):
             #No need for object.__setattr__(self, "AKA", AKA) as it does not change
 
         else:
-            AKA = self.compute_AKZZA_new(surrogate) #compute_AKZZA_new
+            AKA = self.compute_AKZZA_fast(surrogate) #see compute_AKZZA_fast's docstring for the derivation; validated against compute_AKZZA_new in validate_akzza_fast.py (torch.allclose, p=2..32) and validate_akzza_fast_mse.py (8-seed/512-iter resnet_14 MSE)
             object.__setattr__(self, "AKA", AKA)
 
             # AKA_old= self.compute_AKZZA_old(surrogate)
@@ -1498,13 +1625,13 @@ class ShapleyApplication(BaseApplication):
         A_KZX = (
             precomputed_A_KZX
             if precomputed_A_KZX is not None
-            else self.compute_A_KZW_new(W= surrogate._model.train_inputs[0], 
+            else self.compute_A_KZW_new(W= surrogate._model.train_inputs[0],
                                         surrogate= surrogate)
         )
         C = self.get_K_XX_noisy(surrogate)
 
         # C = L L^T
-        L = psd_safe_cholesky(C.to_dense())
+        L = self._cholesky_maybe_incremental(surrogate, C, is_no_refit_step)
         # surrogate._model.prediction_strategy.lik_train_train_covar.root_decomposition().root.to_dense() (but this does not always work)
 
         # Solve L Y = A_KZX^T  -> Y = L^{-1} A_KZX^T
@@ -1675,6 +1802,144 @@ class ShapleyApplication(BaseApplication):
                 P_left_new = P_left_new / s_new
                 log_P = log_P + s_new.log().item()
                 P_left_curr = P_left_new
+
+        return AKZZA
+
+    def compute_AKZZA_fast(self, surrogate) -> torch.Tensor:
+        """O(p) global prefix/suffix rewrite of ``compute_AKZZA_new``.
+
+        Every ``AKZZA[i, i]`` and ``AKZZA[i, j]`` (``j < i``) needs a
+        product over the players excluding ``{i}`` (or ``{i, j}``), split
+        at the cut point ``j`` into a left half (players ``0..j-1``) and a
+        right half (players ``j+1..p-1``, with ``i`` excluded from the
+        middle). The left half never depends on ``i`` -- ``compute_AKZZA_new``
+        rebuilds it from scratch for every ``i`` regardless (its own
+        ``P_left`` walk), an ``O(p) x O(p)`` waste that a single global
+        forward pass (``F`` below, built once) removes entirely. The right
+        half genuinely needs ``i`` excluded from its interior, and an O(1)
+        "punch a hole" isn't available without dividing a factor back out
+        (exactly the synthetic-division instability
+        ``shapleig_greedy_note.md`` warns amplifies error by
+        ``beta^{-p}``), so it stays a per-``i`` walk -- but that walk can
+        start from the cached global suffix ``B[i+1]`` (players
+        ``i+1..p-1``) instead of rebuilding all ``p-1`` factors from an
+        empty seed every time, which both roughly halves it and skips the
+        tail states ``compute_AKZZA_new`` computes and then discards via
+        its ``if j > i: continue``.
+
+        Net effect: total prefix/suffix fold-step count drops from
+        ``~1.5*p^2`` to ``~0.5*p^2``, not an asymptotic order change -- the
+        ``O(p^2)`` pairwise contractions, each itself an ``O(p^2)`` cost
+        einsum, remain the dominant term, so total cost stays
+        ``Theta(p^4)`` either way (see ``HANDOFF_AKZZA.md`` for the
+        checked derivation, including why the earlier "true O(p) global
+        pass" hope doesn't hold). The measured payoff is a constant-factor
+        wall-clock speedup, not a change in scaling behavior.
+        """
+        alpha, beta = self._get_kernel_alpha_beta_new(surrogate, dtype=torch.float64)
+        p = alpha.numel()
+        dtype = alpha.dtype
+        device = alpha.device
+        tiny = torch.finfo(dtype).tiny
+
+        w_in, w_out = self.shapley_w_in_out(p, dtype=dtype, device=device)
+
+        O0 = w_out.clone()
+
+        O1 = torch.zeros(p + 1, dtype=dtype, device=device)
+        O1[:p] = w_out[1:]
+
+        I1 = torch.zeros(p + 1, dtype=dtype, device=device)
+        I1[:p] = w_in[1:]
+
+        I2 = torch.zeros(p + 1, dtype=dtype, device=device)
+        I2[:p - 1] = w_in[2:]
+
+        LEFT_T = torch.stack([O0, O1, I1, I2]).T.contiguous()   # (p+1, 4)
+        RIGHT_T = torch.stack([O0, O1, I1, I2]).T.contiguous()  # (p+1, 4)
+
+        ps = p + 1
+
+        alpha_cpu = alpha.tolist()
+        beta_cpu = beta.tolist()
+
+        def fold_left(table, a_j, b_j):
+            # Same recurrence as compute_AKZZA_new's P_left update: folds
+            # in player j when growing the prefix range forward.
+            new = a_j * table
+            new[:-1, :, :] += b_j * table[1:, :, :]
+            new[:, 1:, :] += b_j * table[:, :-1, :]
+            new[:-1, 1:, :] += a_j * table[1:, :-1, :]
+            s = new.abs().max().clamp_min(tiny)
+            return new / s, s.log().item()
+
+        def fold_right(table, a_j, b_j):
+            # Same recurrence as compute_AKZZA_new's S_right update: folds
+            # in player j when growing the suffix range backward.
+            new = a_j * table
+            new[1:, :, :] += b_j * table[:-1, :, :]
+            new[:, :-1, :] += b_j * table[:, 1:, :]
+            new[1:, :-1, :] += a_j * table[:-1, 1:, :]
+            s = new.abs().max().clamp_min(tiny)
+            return new / s, s.log().item()
+
+        # ---- Global forward pass: F[k] = fold of players 0..k-1, for every k at once ----
+        F = [None] * (p + 1)
+        log_F = [0.0] * (p + 1)
+        F[0] = torch.zeros((ps, ps, 4), dtype=dtype, device=device)
+        F[0][:, 0, :] = LEFT_T
+        for k in range(p):
+            F[k + 1], d = fold_left(F[k], alpha[k], beta[k])
+            log_F[k + 1] = log_F[k] + d
+
+        # ---- Global backward pass: B[k] = fold of players k..p-1, for every k at once ----
+        B = [None] * (p + 1)
+        log_B = [0.0] * (p + 1)
+        B[p] = torch.zeros((ps, ps, 4), dtype=dtype, device=device)
+        B[p][0, :, :] = RIGHT_T
+        for k in range(p - 1, -1, -1):
+            B[k], d = fold_right(B[k + 1], alpha[k], beta[k])
+            log_B[k] = log_B[k + 1] + d
+
+        AKZZA = torch.zeros((p, p), dtype=dtype, device=device)
+
+        for i in range(p):
+            ai_v = alpha_cpu[i]
+            bi_v = beta_cpu[i]
+
+            # ---- Diagonal: F[i] excludes i from the top, B[i+1] excludes i from the bottom ----
+            contracted_diag = torch.einsum('abl,abr->lr', F[i], B[i + 1])
+            scale_diag = log_F[i] + log_B[i + 1]
+            diag_val = ai_v * (contracted_diag[2, 2] + contracted_diag[0, 0]) \
+                     - bi_v * (contracted_diag[2, 0] + contracted_diag[0, 2])
+            AKZZA[i, i] = diag_val.item() * math.exp(scale_diag) / (p * p)
+
+            # ---- Off-diagonal j < i: walk down from i-1 to 0, seeded from the cached global suffix ----
+            H = B[i + 1]
+            log_H = log_B[i + 1]
+            for j in range(i - 1, -1, -1):
+                aj_v = alpha_cpu[j]
+                bj_v = beta_cpu[j]
+
+                contracted = torch.einsum('abl,abr->lr', F[j], H)
+                scale = log_F[j] + log_H
+
+                val = (
+                    ai_v * aj_v * contracted[0, 0] + bi_v * aj_v * contracted[0, 1]
+                    - ai_v * bj_v * contracted[0, 2] - bi_v * bj_v * contracted[0, 3]
+                    + ai_v * bj_v * contracted[1, 0] + bi_v * bj_v * contracted[1, 1]
+                    - ai_v * aj_v * contracted[1, 2] - bi_v * aj_v * contracted[1, 3]
+                    - bi_v * aj_v * contracted[2, 0] - ai_v * aj_v * contracted[2, 1]
+                    + bi_v * bj_v * contracted[2, 2] + ai_v * bj_v * contracted[2, 3]
+                    - bi_v * bj_v * contracted[3, 0] - ai_v * bj_v * contracted[3, 1]
+                    + bi_v * aj_v * contracted[3, 2] + ai_v * aj_v * contracted[3, 3]
+                ).item() * math.exp(scale) / (p * p)
+
+                AKZZA[i, j] = val
+                AKZZA[j, i] = val
+
+                H, d = fold_right(H, alpha[j], beta[j])
+                log_H = log_H + d
 
         return AKZZA
 ##########################

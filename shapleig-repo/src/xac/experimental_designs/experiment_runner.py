@@ -46,6 +46,13 @@ _EIG_CACHE_ATTRS = (
     "prev_X_binary",
     "_aka_cache_key_value",
     "_aka_cache_matrix",
+    # compute_AEA_new's incremental Cholesky-update cache (fast_fit only;
+    # see applications.py's _cholesky_maybe_incremental). The readout
+    # surrogate has different hyperparameters at the same archive size, so
+    # without protecting this the next real (gp) no-refit step would pass
+    # the size check and incrementally update onto the wrong factor.
+    "_L_cache",
+    "_L_cache_chain_len",
 )
 
 
