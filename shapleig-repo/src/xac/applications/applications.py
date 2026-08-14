@@ -686,6 +686,11 @@ class ShapleyApplication(BaseApplication):
     init_design_factor: int = 2  # Initial design size is init_design_factor * m
     init_design_size: int = False # Computed in lazy setup based on dimensionality
     random_init_design: bool = False  # Random init design option for ablation study
+    # Use compute_AKZZA_fast (see its docstring) instead of compute_AKZZA_new
+    # in compute_AEA_new. Defaults off so every arm keeps its previously
+    # published numbers exactly; set per-config for the one arm meant to
+    # demonstrate the speedup (HANDOFF_AKZZA.md follow-up, 2026-08-14).
+    use_akzza_fast: bool = False
 
     # ---------------- required overrides -----------------------------
     def run_lazy_setup(
@@ -1612,7 +1617,17 @@ class ShapleyApplication(BaseApplication):
             #No need for object.__setattr__(self, "AKA", AKA) as it does not change
 
         else:
-            AKA = self.compute_AKZZA_fast(surrogate) #see compute_AKZZA_fast's docstring for the derivation; validated against compute_AKZZA_new in validate_akzza_fast.py (torch.allclose, p=2..32) and validate_akzza_fast_mse.py (8-seed/512-iter resnet_14 MSE)
+            # See compute_AKZZA_fast's docstring for the derivation; validated
+            # against compute_AKZZA_new in validate_akzza_fast.py (torch.allclose,
+            # p=2..32) and validate_akzza_fast_mse.py (8-seed/512-iter resnet_14
+            # MSE). Gated per-application (use_akzza_fast, default False) rather
+            # than applied unconditionally: every arm's previously published
+            # numbers stay exactly reproducible unless a config opts in.
+            AKA = (
+                self.compute_AKZZA_fast(surrogate)
+                if self.use_akzza_fast
+                else self.compute_AKZZA_new(surrogate)
+            )
             object.__setattr__(self, "AKA", AKA)
 
             # AKA_old= self.compute_AKZZA_old(surrogate)

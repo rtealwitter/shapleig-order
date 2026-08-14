@@ -27,26 +27,40 @@ FIGDIR = os.path.join(HERE, "figures")
 ARMS = {
     "xac.acquisition_functions.EIGFunctionProperty":
         ("ShaplEIG (EIG, refit every iter)", "#b45309"),
+    # Single Hybrid arm (2026-08-14): the old exact-fit Hybrid and the
+    # AcceleratedFitConfig "+fast" Hybrid were consolidated into one arm --
+    # investigation (HANDOFF_AKZZA.md) found fit_accelerated's own
+    # CG/Lanczos+odd-part-folding fitting acceleration is unreliable (no
+    # benefit on resnet_14, a net regression on vit_9), unrelated to and
+    # independent of the compute_AKZZA_fast speedup. So this arm keeps the
+    # exact MLM fit (reliable) and adds only compute_AKZZA_fast
+    # (application.use_akzza_fast=true, always a pure exact reformulation
+    # with no accuracy cost -- see applications.py's docstring). collect()
+    # below drops any pre-existing HybridPairedEIG run (exact-fit or
+    # AcceleratedFitConfig "+fast") that predates this consolidation, by
+    # config field rather than by root, so old and new sweep roots can be
+    # passed together safely.
     "xac.acquisition_functions.HybridPairedEIG":
-        ("Hybrid: extremes then EIG, geometric refits", "#1d4ed8"),
+        ("Hybrid: extremes then EIG, geometric refits (AKZZA-accelerated)", "#1d4ed8"),
     "xac.acquisition_functions.PairedExtremes":
         ("Paired extremes (fixed order)", "#0d9488"),
     "xac.acquisition_functions.LeverageGPSampler":
         ("GP + Leverage Score Sampling", "#7c3aed"),
     "xac.acquisition_functions.Random":
         ("GP + Random", "#be185d"),
-    # Fast-fit variants: same acquisition/selection logic, but every GP fit
-    # goes through AcceleratedFitConfig (CG/Lanczos + inducing-point
-    # transplant + odd-part folding, src/xac/surrogates/fast_fit.py)
-    # instead of the exact MLM fit -- see collect() below for the
-    # "+fast" suffix that distinguishes them from their exact counterparts.
+    # Fast-fit PairedExtremes: same acquisition/selection logic, but every
+    # GP fit (for readout only -- PairedExtremes itself needs no fitting to
+    # select) goes through AcceleratedFitConfig (CG/Lanczos + inducing-point
+    # transplant + odd-part folding, src/xac/surrogates/fast_fit.py) instead
+    # of the exact MLM fit -- see collect() below for the "+fast" suffix
+    # that distinguishes it from its exact counterpart. Left as-is; only
+    # the Hybrid arms were consolidated (see above).
     "xac.acquisition_functions.PairedExtremes+fast":
         ("Non-adaptive, fast fit (CG+ind.pts+odd)", "#059669"),
-    "xac.acquisition_functions.HybridPairedEIG+fast":
-        ("Hybrid + fast fit (CG+ind.pts+odd)", "#4338ca"),
 }
 LEVGP = "xac.acquisition_functions.LeverageGPSampler"
 FAST_FIT_TARGET_SUFFIX = "AcceleratedFitConfig"
+HYBRID_ACQ = "xac.acquisition_functions.HybridPairedEIG"
 GAME_ORDER = ["vit_9", "dvbsgb_10", "dvbsrf_10", "dvchgb_10",
               "resnet_14", "vit_16"]  # rows in increasing p
 GAME_TITLES = {"dvbsrf_10": "DV; RF; Bike Sharing (p=10)",
@@ -86,6 +100,22 @@ def collect(roots):
             )
             if fit_target.endswith(FAST_FIT_TARGET_SUFFIX):
                 acq = acq + "+fast"
+
+            if acq in (HYBRID_ACQ, HYBRID_ACQ + "+fast"):
+                # Consolidated to one Hybrid arm (see ARMS' comment): drop
+                # any Hybrid run that predates the AKZZA-speedup
+                # consolidation, identified by config field (works
+                # regardless of which root -- old or new -- a run came
+                # from, so callers can pass both together safely) rather
+                # than by "+fast" suffix, since the retained arm is
+                # exact-fit (no suffix) but *not* every exact-fit Hybrid
+                # run qualifies -- only ones with the flag set.
+                use_akzza_fast = cfg.get("application", {}).get(
+                    "use_akzza_fast", False
+                )
+                if not use_akzza_fast:
+                    continue
+                acq = HYBRID_ACQ
 
             def arr(key):
                 v = met.get(key)
