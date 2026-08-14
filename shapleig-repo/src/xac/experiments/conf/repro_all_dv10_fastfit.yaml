@@ -59,7 +59,12 @@ hydra:
   sweeper:
     params:
       blackbox.name: dvbsgb_10,dvchgb_10,dvbsrf_10
-      acquisition._target_: xac.acquisition_functions.PairedExtremes,xac.acquisition_functions.HybridPairedEIG
+      # HybridPairedEIG removed 2026-08-14: the hybrid arm moved to exact
+      # fit + compute_AKZZA_fast (repro_all_dv10_hybrid_akzza.yaml) after
+      # AcceleratedFitConfig's own fitting acceleration was found unreliable
+      # (see README.md's "Hybrid vs. ShaplEIG" / "AKZZA speedup"). This
+      # config's only live use now is PairedExtremes+fast.
+      acquisition._target_: xac.acquisition_functions.PairedExtremes
       meta.seed: range(1,31)
   sweep:
     dir: multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}

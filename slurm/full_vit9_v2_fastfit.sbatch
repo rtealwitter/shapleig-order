@@ -1,6 +1,7 @@
 #!/bin/bash
-# Fast-fit companion to full_vit9_v2.sbatch: vit_9 (p=9) x 2 acquisitions
-# (PairedExtremes, HybridPairedEIG) x 30 seeds, 490 iterations, exhaustive
+# Fast-fit companion to full_vit9_v2.sbatch: vit_9 (p=9) x 1 acquisition
+# (PairedExtremes only as of 2026-08-14 -- HybridPairedEIG moved to
+# full_vit9_v2_hybrid_akzza.sbatch) x 30 seeds, 490 iterations, exhaustive
 # candidates, AcceleratedFitConfig instead of the exact MLM fit. See
 # full_dv10_v2_fastfit.sbatch for the arm-matching note. Appends its root
 # to sweep_roots_v2.txt.

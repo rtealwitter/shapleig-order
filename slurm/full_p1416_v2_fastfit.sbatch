@@ -1,9 +1,10 @@
 #!/bin/bash
-# Fast-fit companion to full_p1416_v2.sbatch: resnet_14 + vit_16 x 2
-# acquisitions (PairedExtremes, HybridPairedEIG) x 30 seeds, 512
-# iterations, Subset(1024) candidates, AcceleratedFitConfig instead of the
-# exact MLM fit. See full_dv10_v2_fastfit.sbatch for the arm-matching note.
-# Appends its root to sweep_roots_v2.txt.
+# Fast-fit companion to full_p1416_v2.sbatch: resnet_14 + vit_16 x 1
+# acquisition (PairedExtremes only as of 2026-08-14 -- HybridPairedEIG
+# moved to full_p1416_v2_hybrid_akzza.sbatch) x 30 seeds, 512 iterations,
+# Subset(1024) candidates, AcceleratedFitConfig instead of the exact MLM
+# fit. See full_dv10_v2_fastfit.sbatch for the arm-matching note. Appends
+# its root to sweep_roots_v2.txt.
 #SBATCH --partition=main
 #SBATCH --account=standard
 #SBATCH --nodes=1
@@ -31,7 +32,7 @@ export MPLBACKEND=Agg
 # inside the same before/after window). Suffixing hydra's own sweep dir
 # with this job's SLURM_JOB_ID makes the directory name unique by
 # construction, so there is nothing left to infer or race.
-echo "[$(date)] node $(hostname) starting resnet_14+vit_16 fast-fit sweep (120 jobs)"
+echo "[$(date)] node $(hostname) starting resnet_14+vit_16 fast-fit sweep (60 jobs)"
 $PY -m xac.experiments.cli --config-path conf --config-name repro_all_p1416_fastfit \
     hydra.sweep.dir='multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}-'"$SLURM_JOB_ID"
 rc=$?

@@ -165,7 +165,18 @@ class Random(BaseAcquisitionFunction):
 
 @dataclass(frozen=True)
 class EIGFunctionProperty(BaseAcquisitionFunction):
-    """Efficient implementation of the Shapley-based EIG (ShapEIG; EIG for the function property) for the Shapley values."""
+    """Efficient implementation of the Shapley-based EIG (ShapEIG; EIG for the function property) for the Shapley values.
+
+    This is "ShaplEIG" in ../../../../README.md and figures/all_games.png:
+    argmax EIG over all candidates every call, no fixed schedule. Refit
+    frequency is controlled by the surrogate's ``fit_config`` (see
+    ``experiment_runner.py``), not by this class -- this project's own
+    sweeps (``experiments/conf/repro_all_*.yaml``) leave it at
+    ``refit_interval: 1`` (every iteration). ``HybridPairedEIG`` below
+    subclasses this and falls back to its ``__call__`` once its fixed
+    extremes schedule is exhausted; see the README's "Hybrid vs. ShaplEIG"
+    section for the precise, verified list of what differs.
+    """
      #NEW
 
     @torch.no_grad()
@@ -766,6 +777,19 @@ class HybridPairedEIG(EIGFunctionProperty):
     experiment runner refits the hyperparameters on a geometric schedule
     anchored at that handover iteration (the "adaptivity rounds") and the
     parent EIG updates incrementally between refits.
+
+    This is the single "Hybrid" arm in ../../../../README.md and
+    figures/all_games.png as of 2026-08-14 (previously plotted as two
+    variants -- exact-fit and AcceleratedFitConfig "fast fit" -- consolidated
+    into one after the fast-fit GP-fitting acceleration was found unreliable
+    on some games; see the README's "AKZZA speedup"). Its production configs
+    (``experiments/conf/repro_all_*_hybrid_akzza.yaml``) use the exact MLM
+    fit plus ``application.use_akzza_fast: true`` -- that flag lives on the
+    application, not this class, so it applies identically whether the
+    fallback EIG argmax above is reached from here or from plain
+    ``EIGFunctionProperty``; only the *config* currently differs between the
+    two, not anything in this class. See the README's "Hybrid vs. ShaplEIG"
+    section for the full, verified comparison.
     """
 
     schedule_path: str = "data/paired_schedule_p{p}.npy"

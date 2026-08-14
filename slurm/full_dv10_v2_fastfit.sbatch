@@ -1,13 +1,15 @@
 #!/bin/bash
-# Fast-fit companion to full_dv10_v2.sbatch: 3 DV games (p=10) x 2
-# acquisitions (PairedExtremes, HybridPairedEIG) x 30 seeds, 512
-# iterations, exhaustive candidates, AcceleratedFitConfig (CG/Lanczos +
-# inducing-point transplant + odd-part folding, src/xac/surrogates/
-# fast_fit.py) instead of the exact MLM fit. The exact-fit counterparts for
-# these two arms (plus ShaplEIG/GP+Leverage/GP+Random) come from the
-# unmodified full_dv10_v2.sbatch; repro_plots.py distinguishes the two by
-# the "+fast" suffix it adds when surrogate.fit_config._target_ is
-# AcceleratedFitConfig. Appends its root to sweep_roots_v2.txt.
+# Fast-fit companion to full_dv10_v2.sbatch: 3 DV games (p=10) x 1
+# acquisition (PairedExtremes only as of 2026-08-14 -- HybridPairedEIG
+# moved to full_dv10_v2_hybrid_akzza.sbatch, see repro_all_dv10_fastfit.yaml's
+# comment) x 30 seeds, 512 iterations, exhaustive candidates,
+# AcceleratedFitConfig (CG/Lanczos + inducing-point transplant + odd-part
+# folding, src/xac/surrogates/fast_fit.py) instead of the exact MLM fit. The
+# exact-fit counterpart for PairedExtremes (plus ShaplEIG/GP+Leverage/
+# GP+Random) comes from the unmodified full_dv10_v2.sbatch; repro_plots.py
+# distinguishes the two by the "+fast" suffix it adds when
+# surrogate.fit_config._target_ is AcceleratedFitConfig. Appends its root
+# to sweep_roots_v2.txt.
 #
 # mem=500gb (up from 200gb, which matches the exact baseline's own
 # allocation): a single-worker diagnostic (diag_memory.py) showed
@@ -46,7 +48,7 @@ export MPLBACKEND=Agg
 # window). Suffixing hydra's own sweep dir with this job's SLURM_JOB_ID
 # makes the directory name unique by construction, so there is nothing
 # left to infer or race.
-echo "[$(date)] node $(hostname) starting dv10 fast-fit sweep (180 jobs)"
+echo "[$(date)] node $(hostname) starting dv10 fast-fit sweep (90 jobs)"
 $PY -m xac.experiments.cli --config-path conf --config-name repro_all_dv10_fastfit \
     hydra.sweep.dir='multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}-'"$SLURM_JOB_ID"
 rc=$?
