@@ -430,34 +430,7 @@ def run_experiment(
             # once and read the posterior — so a separate evaluation-only GP
             # is fit here. Its cost is recorded in eval_fit_durations, NOT in
             # the method's fit time.
-            #
-            # Hybrid is the one exception (2026-08-14): unlike PairedExtremes
-            # and Random, whose own `gp` is *never* fit (selection needs no
-            # GP at all, so `gp` sits at default/prior hyperparameters for
-            # the whole run -- a separate readout fit is the only place they
-            # ever get a real one), Hybrid's `gp` genuinely is refit
-            # periodically (the geometric schedule past the extremes
-            # handover) and its training data stays current via
-            # `gp.update_data(...)` above even between refits. So reusing it
-            # for the readout is a real, if between-refits stale,
-            # data-fit surrogate -- not a meaningless one -- and skips the
-            # extra fit entirely, matching how ShaplEIG's readout already
-            # gets it for free by construction (it never leaves this
-            # surrogate stale in the first place).
-            #
-            # `hybrid_handover is not None` matters: during the *extremes*
-            # phase (before handover), `gp` is in exactly the same never-fit
-            # state as PairedExtremes/Random (confirmed by a crash without
-            # this guard -- outcome_transform chokes on an unfit model's
-            # degenerate posterior). Only once handover has happened at
-            # least once (the k=0 refit right at the handover iteration)
-            # does `gp` hold real hyperparameters worth reusing.
-            skip_separate_readout_fit = (
-                isinstance(acquisition_fn, HybridPairedEIG)
-                and is_no_refit_step
-                and hybrid_handover is not None
-            )
-            if is_no_refit_step and not meta_cfg.skip_fitting and not skip_separate_readout_fit:
+            if is_no_refit_step and not meta_cfg.skip_fitting:
                 if meta_cfg.time_ops:
                     start_eval_fit = time.perf_counter()
 
