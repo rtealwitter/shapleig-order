@@ -71,15 +71,33 @@ which is all the acquisition rule's own (possibly stale, for efficiency)
 internal GP needs to answer, so the two are allowed to use different
 hyperparameters (`experiment_runner.py:426-431`). Since ShaplEIG always
 just refit the GP it needs for selection, its readout can reuse that same
-fit for free. The hybrid arm's readout, by contrast, needs its *own*
-separate fit on almost every iteration (whenever it didn't just refit for
-selection — i.e. during the extremes phase or between geometric-schedule
-refits), recorded in `eval_fit_duration` rather than the method's own
-`hp_fit_duration`, and added back on top of selection cost in the "compute
-by evaluations" panel below (a real user does pay for it). This is exactly
-the call site `compute_AKZZA_fast` helps most, and why the speedup shows up
-far more in the hybrid arm's wall-clock profile than it would in ShaplEIG's
-today.
+fit for free.
+
+The hybrid arm's readout used to need its *own* separate fit on almost
+every iteration (whenever it didn't just refit for selection). As of
+2026-08-14 it no longer does, for the iterations where that's safe: once
+the extremes-to-EIG handover has happened at least once (so `gp` holds
+real, periodically-refit hyperparameters, with training data kept current
+via `gp.update_data(...)` even between refits), the readout reuses `gp`
+directly instead of fitting a fresh evaluation-only surrogate. Validated on
+resnet_14 (8 seeds, 512 iterations) against the separate-fit version: final
+MSE matched to displayed precision on every seed, while summed readout time
+dropped 177x and summed total selection+readout time dropped 33x — the
+staleness that remains (a handful of iterations since the last geometric
+refit, out of an archive already at 500+ points) turned out not to move the
+reported estimate measurably at this scale. The exception is the extremes
+phase itself (before the first handover), where `gp` is never fit at all
+(same as `PairedExtremes`/`Random`) — that still needs the separate fit,
+since there's no real surrogate yet to reuse.
+
+Note this mostly doesn't show up as a shift in the "compute by evaluations"
+panel below: that panel's cost accounting already added only *one* final
+readout per point (`cum_ext + readout` in `collect()`, not a running sum of
+every readout along the way) to represent what a user stopping at that one
+budget would pay — it was never summing the *per-iteration* readout cost
+this change targets. What it *does* change dramatically is the wall-clock
+cost of actually running these sweeps: the hybrid arm's production sweep
+went from 21m40s/11m/2h19m (dv10/vit9/p1416) to 5m38s/1m23s/8m10s.
 
 **AKZZA speedup.** `compute_AKZZA_new` (the closed-form
 $\mathbf{A}K_\xi(\mathbf{Z},\mathbf{Z})\mathbf{A}^\top$ computation, the
